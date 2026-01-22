@@ -11,14 +11,15 @@ UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序（�
     - 上排：原始数据的俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
     - 下排：滤波后数据的俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
 
-改进版滤波算法（三步滤波流程）：
+改进版滤波算法（两步滤波流程）：
     Step 1 (物理约束检查): 检测数据是否在物理可能的范围内
         - 绝对范围限制（距离、角度）
         - 速度限制（位置变化不能超过物理可能的速度）
     Step 2 (中位数滤波): 使用窗口为5的中位数滤波消除尖峰异常
         - 对距离、方位角、仰角、X、Y、Z分别进行中位数滤波
         - 方位角使用角度归一化处理0°/360°边界
-    Step 3 (卡尔曼滤波平滑): 使用卡尔曼滤波进行最终平滑
+    
+    注意：传感器数据已自带卡尔曼滤波，因此本程序不再额外添加卡尔曼滤波
 
 硬件连接：
     - UWB基站通过USB转TTL模块连接到电脑
@@ -49,7 +50,7 @@ import struct
 import threading
 import time
 from collections import deque
-from typing import Tuple, Optional, Dict
+from typing import Optional, Dict
 import statistics
 
 # 尝试导入依赖库
@@ -104,62 +105,6 @@ MAX_VELOCITY = 300          # 最大允许速度
 
 # 中位数滤波窗口大小（必须为奇数）
 MEDIAN_WINDOW_SIZE = 5
-
-
-# ============================================================================
-# 卡尔曼滤波器（从uwb_data_filter.py提取）
-# ============================================================================
-
-class KalmanFilter1D:
-    """一维卡尔曼滤波器"""
-    
-    def __init__(self, q=0.1, r=0.5, initial_value=0.0):
-        self.q = q  # 过程噪声
-        self.r = r  # 测量噪声
-        self.x = initial_value  # 状态估计值
-        self.p = 1.0  # 估计误差协方差
-        self.k = 0.0  # 卡尔曼增益
-        self.initialized = False
-    
-    def update(self, measurement: float) -> float:
-        if not self.initialized:
-            self.x = measurement
-            self.initialized = True
-            return self.x
-        
-        p_pred = self.p + self.q
-        self.k = p_pred / (p_pred + self.r)
-        self.x = self.x + self.k * (measurement - self.x)
-        self.p = (1 - self.k) * p_pred
-        
-        return self.x
-    
-    def reset(self):
-        self.x = 0.0
-        self.p = 1.0
-        self.k = 0.0
-        self.initialized = False
-
-
-class KalmanFilter3D:
-    """三维卡尔曼滤波器"""
-    
-    def __init__(self, q=0.1, r=0.5):
-        self.filter_x = KalmanFilter1D(q, r)
-        self.filter_y = KalmanFilter1D(q, r)
-        self.filter_z = KalmanFilter1D(q, r)
-    
-    def update(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
-        return (
-            self.filter_x.update(x),
-            self.filter_y.update(y),
-            self.filter_z.update(z)
-        )
-    
-    def reset(self):
-        self.filter_x.reset()
-        self.filter_y.reset()
-        self.filter_z.reset()
 
 
 # ============================================================================
@@ -501,22 +446,22 @@ class PhysicalConstraintFilter:
 
 
 # ============================================================================
-# 综合数据滤波器（三步滤波流程）
+# 综合数据滤波器（两步滤波流程）
 # ============================================================================
 
 class UWBDataFilter:
     """
     UWB数据综合滤波器 - 实现机器狗传感器数据滤波的完整流程
     
-    三步滤波流程：
+    两步滤波流程：
         Step 1 (物理约束检查): 应用物理约束滤波
             - 如果传感器说头部朝向后方（但物理上不可能），丢弃该帧
             - 使用上一个有效值
         
         Step 2 (去尖峰): 将有效数据通过中位数滤波器（窗口大小3或5）
             - 这能消除随机的"毛刺"
-        
-        Step 3 (平滑): 如果数据仍然抖动，通过卡尔曼滤波或移动平均
+    
+    注意：传感器数据已自带卡尔曼滤波，因此本程序不再额外添加卡尔曼滤波
     
     参考：《Probabilistic Robotics》 (Thrun, Burgard, Fox)
     """
@@ -527,10 +472,7 @@ class UWBDataFilter:
                  max_distance: float = MAX_DISTANCE,
                  max_velocity: float = MAX_VELOCITY,
                  # 中位数滤波参数
-                 median_window: int = MEDIAN_WINDOW_SIZE,
-                 # 卡尔曼滤波参数
-                 kalman_q: float = 0.1,
-                 kalman_r: float = 0.5):
+                 median_window: int = MEDIAN_WINDOW_SIZE):
         """
         初始化综合滤波器
         
@@ -539,8 +481,6 @@ class UWBDataFilter:
             max_distance: 最大有效距离
             max_velocity: 最大允许速度
             median_window: 中位数滤波窗口大小
-            kalman_q: 卡尔曼过程噪声（越大响应越快）
-            kalman_r: 卡尔曼测量噪声（越大越平滑）
         """
         # ===== Step 1: 物理约束滤波器 =====
         self.physical_filter = PhysicalConstraintFilter(
@@ -557,9 +497,7 @@ class UWBDataFilter:
         self.median_y = MedianFilter(median_window)
         self.median_z = MedianFilter(median_window)
         
-        # ===== Step 3: 卡尔曼滤波器（最终平滑） =====
-        self.kalman_filter = KalmanFilter3D(q=kalman_q, r=kalman_r)
-        self.kalman_distance = KalmanFilter1D(q=kalman_q, r=kalman_r)
+        # 注意：传感器数据已自带卡尔曼滤波，不再额外添加
         
         # 统计信息
         self.total_count = 0
@@ -574,7 +512,7 @@ class UWBDataFilter:
                x: float, y: float, z: float,
                current_time: float = None) -> dict:
         """
-        执行三步滤波流程
+        执行两步滤波流程
         
         Args:
             distance: 原始距离（厘米）
@@ -617,26 +555,16 @@ class UWBDataFilter:
         median_y = self.median_y.filter(y)
         median_z = self.median_z.filter(z)
         
-        # ========== Step 3: 卡尔曼滤波（平滑） ==========
-        kalman_x, kalman_y, kalman_z = self.kalman_filter.update(
-            median_x, median_y, median_z
-        )
-        kalman_distance = self.kalman_distance.update(median_distance)
-        
-        # 构建结果
+        # 构建结果（传感器数据已自带卡尔曼滤波，直接使用中位数滤波结果）
         result = {
-            'distance': round(kalman_distance, 2),
+            'distance': round(median_distance, 2),
             'azimuth': round(median_azimuth, 2),
             'elevation': round(median_elevation, 2),
-            'x': round(kalman_x, 2),
-            'y': round(kalman_y, 2),
-            'z': round(kalman_z, 2),
+            'x': round(median_x, 2),
+            'y': round(median_y, 2),
+            'z': round(median_z, 2),
             'is_outlier': False,
-            'reject_reason': None,
-            # 中间结果（用于调试）
-            'median_x': round(median_x, 2),
-            'median_y': round(median_y, 2),
-            'median_z': round(median_z, 2)
+            'reject_reason': None
         }
         
         self.last_valid_data = result.copy()
@@ -663,8 +591,6 @@ class UWBDataFilter:
         self.median_x.reset()
         self.median_y.reset()
         self.median_z.reset()
-        self.kalman_filter.reset()
-        self.kalman_distance.reset()
         self.total_count = 0
         self.outlier_count = 0
         self.reject_count_range = 0
