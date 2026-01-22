@@ -31,7 +31,7 @@
 
 #define FRAME_HEADER        0xFFFFFFFF  // 数据帧头标识
 #define CMD_POSITION_DATA   0x2001      // 位置数据命令字
-#define FRAME_LENGTH        33          // 完整数据帧长度（字节）
+#define FRAME_LENGTH        37          // 完整数据帧长度（字节）- 根据协议：4帧头+2长度+2流号+2命令+2版本+4基站ID+4标签ID+4距离+2方位角+2仰角+2状态+2序号+4预留+1校验=37
 #define BUFFER_SIZE         256         // 接收缓冲区大小
 #define PI                  3.14159265358979323846  // 圆周率
 
@@ -42,34 +42,50 @@
 /**
  * @brief UWB数据帧结构体
  * @note  数据采用大端序(Big-Endian)传输，需要进行字节序转换
+ * 
+ * 协议格式（共37字节）：
+ * - MessageHeader:   4字节  帧头 0xFFFFFFFF
+ * - PacketLength:    2字节  消息体长度
+ * - SequenceID:      2字节  消息流水号
+ * - RequestCommand:  2字节  命令码 0x2001
+ * - VersionID:       2字节  协议版本 0x0100
+ * - AnchorID:        4字节  基站ID
+ * - TagID:           4字节  标签ID
+ * - Distance:        4字节  距离，单位：cm（厘米）
+ * - Azimuth:         2字节  方位角，单位：度
+ * - Elevation:       2字节  仰角，单位：度
+ * - TagStatus:       2字节  标签状态
+ * - BatchSn:         2字节  测距序号
+ * - Reserve:         4字节  预留
+ * - XorByte:         1字节  异或校验
  */
 #pragma pack(push, 1)  // 取消字节对齐，确保结构体紧凑排列
 typedef struct {
-    uint32_t frameHeader;      // 帧头: 0xFFFFFFFF
-    uint16_t packetLength;     // 数据包长度
-    uint16_t sequenceID;       // 序列号
-    uint16_t requestCommand;   // 命令字: 0x2001表示位置数据
-    uint16_t versionID;        // 版本号
-    uint32_t anchorID;         // 基站ID
-    uint32_t tagID;            // 信标ID
-    uint32_t distance;         // 距离（单位：毫米）
-    int16_t  azimuth;          // 方位角（水平角度，单位：0.01度）
-    int16_t  elevation;        // 俯仰角（垂直角度，单位：0.01度）
-    uint16_t tagStatus;        // 信标状态
-    uint16_t batchSn;          // 批次序号
-    uint32_t reserve;          // 保留字段
-    uint8_t  xorCheck;         // 异或校验
+    uint32_t frameHeader;      // 帧头: 0xFFFFFFFF (4字节)
+    uint16_t packetLength;     // 数据包长度 (2字节)
+    uint16_t sequenceID;       // 序列号 (2字节)
+    uint16_t requestCommand;   // 命令字: 0x2001表示位置数据 (2字节)
+    uint16_t versionID;        // 版本号: 0x0100 (2字节)
+    uint32_t anchorID;         // 基站ID (4字节)
+    uint32_t tagID;            // 信标ID (4字节)
+    uint32_t distance;         // 距离，单位：cm（厘米）(4字节)
+    int16_t  azimuth;          // 方位角，单位：度 (2字节)
+    int16_t  elevation;        // 俯仰角（仰角），单位：度 (2字节)
+    uint16_t tagStatus;        // 信标状态 (2字节)
+    uint16_t batchSn;          // 测距序号 (2字节)
+    uint32_t reserve;          // 预留字段 (4字节)
+    uint8_t  xorCheck;         // 异或校验 (1字节)
 } UWBDataFrame;
 #pragma pack(pop)
 
 /**
  * @brief 坐标结构体
- * @note  用于存储转换后的二维坐标
+ * @note  用于存储转换后的二维坐标，单位统一为厘米(cm)
  */
 typedef struct {
-    double x;       // X坐标（单位：毫米）
-    double y;       // Y坐标（单位：毫米）
-    double z;       // Z坐标（单位：毫米，可选）
+    double x;       // X坐标（单位：厘米）
+    double y;       // Y坐标（单位：厘米）
+    double z;       // Z坐标（单位：厘米，可选）
 } Coordinate3D;
 
 /**
@@ -77,11 +93,12 @@ typedef struct {
  * @note  解析后的完整定位信息
  */
 typedef struct {
-    uint32_t    distance_mm;    // 距离（毫米）
+    uint32_t    distance_cm;    // 距离（厘米）
     double      azimuth_deg;    // 方位角（度）
     double      elevation_deg;  // 俯仰角（度）
-    Coordinate3D coord;         // 转换后的坐标
+    Coordinate3D coord;         // 转换后的坐标（厘米）
     uint32_t    tagID;          // 信标ID
+    uint32_t    anchorID;       // 基站ID
     bool        valid;          // 数据是否有效
 } PositionInfo;
 
@@ -121,6 +138,24 @@ uint32_t swapEndian32(uint32_t value) {
 }
 
 /**
+ * @brief 计算异或校验值
+ * @param data 数据缓冲区
+ * @param length 数据长度（不包含校验字节本身）
+ * @return 异或校验结果
+ * @note  校验方式：该字节前所有字节的异或
+ */
+uint8_t calculateXorCheck(uint8_t* data, int length) {
+    uint8_t xorValue = 0;
+    for (int i = 0; i < length; i++) {
+        xorValue ^= data[i];
+    }
+    return xorValue;
+}
+           ((value & 0x00FF0000) >> 8)  |
+           ((value & 0xFF000000) >> 24);
+}
+
+/**
  * @brief 角度转弧度
  * @param degrees 角度值
  * @return 弧度值
@@ -131,10 +166,10 @@ double degreesToRadians(double degrees) {
 
 /**
  * @brief 将球坐标（距离、方位角、俯仰角）转换为笛卡尔坐标（X, Y, Z）
- * @param distance_mm  距离（毫米）
+ * @param distance_cm  距离（厘米）
  * @param azimuth_deg  方位角（度），正前方为0度，顺时针为正
  * @param elevation_deg 俯仰角（度），水平为0度，向上为正
- * @return 三维坐标
+ * @return 三维坐标（厘米）
  * 
  * @note 坐标系定义：
  *       - Y轴：正前方
@@ -146,7 +181,7 @@ double degreesToRadians(double degrees) {
  *       y = distance * cos(elevation) * cos(azimuth)
  *       z = distance * sin(elevation)
  */
-Coordinate3D sphericalToCartesian(double distance_mm, double azimuth_deg, double elevation_deg) {
+Coordinate3D sphericalToCartesian(double distance_cm, double azimuth_deg, double elevation_deg) {
     Coordinate3D coord;
     
     // 将角度转换为弧度
@@ -155,7 +190,7 @@ Coordinate3D sphericalToCartesian(double distance_mm, double azimuth_deg, double
     
     // 计算三维坐标
     // cos(elevation) 是水平投影系数
-    double horizontalDistance = distance_mm * cos(elevation_rad);
+    double horizontalDistance = distance_cm * cos(elevation_rad);
     
     // X坐标：左右方向，右侧为正
     coord.x = horizontalDistance * sin(azimuth_rad);
@@ -164,7 +199,7 @@ Coordinate3D sphericalToCartesian(double distance_mm, double azimuth_deg, double
     coord.y = horizontalDistance * cos(azimuth_rad);
     
     // Z坐标：上下方向，向上为正
-    coord.z = distance_mm * sin(elevation_rad);
+    coord.z = distance_cm * sin(elevation_rad);
     
     return coord;
 }
@@ -304,13 +339,30 @@ int findFrameHeader(uint8_t* buffer, int length) {
 
 /**
  * @brief 解析UWB数据帧
- * @param frameData 完整的数据帧（33字节）
+ * @param frameData 完整的数据帧（37字节）
  * @param posInfo   输出的位置信息
  * @return 解析成功返回true，失败返回false
+ * 
+ * @note 协议示例1：距离25cm，角度18度
+ *       FF FF FF FF 00 25 00 0B 20 01 01 00 00 00 AA A2 00 00 AA A1 00 00 00 19 00 12 FF CA 12 34 00 0B 00 00 00 00 1E
+ *       距离=0x19=25cm，方位角=0x12=18度
+ * 
+ * @note 协议示例2：距离98cm，角度-39度
+ *       FF FF FF FF 00 25 00 27 20 01 01 00 00 00 AA A2 00 00 AA A1 00 00 00 62 FF D9 00 0D 12 34 00 27 00 00 00 00 69
+ *       距离=0x62=98cm，方位角=0xFFD9=-39度（有符号）
  */
 bool parseUWBFrame(uint8_t* frameData, PositionInfo* posInfo) {
     // 将字节数据映射到结构体
     UWBDataFrame* frame = (UWBDataFrame*)frameData;
+    
+    // 验证异或校验（校验字节前所有字节的异或）
+    uint8_t calculatedXor = calculateXorCheck(frameData, FRAME_LENGTH - 1);
+    if (calculatedXor != frame->xorCheck) {
+        // 校验失败，数据可能损坏
+        std::cerr << "[警告] 数据校验失败，丢弃该帧" << std::endl;
+        posInfo->valid = false;
+        return false;
+    }
     
     // 转换字节序并验证命令字
     uint16_t command = swapEndian16(frame->requestCommand);
@@ -322,19 +374,22 @@ bool parseUWBFrame(uint8_t* frameData, PositionInfo* posInfo) {
     }
     
     // 解析并转换各字段（大端序 -> 小端序）
-    posInfo->distance_mm = swapEndian32(frame->distance);
+    // 距离单位：厘米(cm)
+    posInfo->distance_cm = swapEndian32(frame->distance);
     posInfo->tagID = swapEndian32(frame->tagID);
+    posInfo->anchorID = swapEndian32(frame->anchorID);
     
-    // 方位角和俯仰角：原始值单位是0.01度，需要除以100转换为度
+    // 方位角和俯仰角：单位直接是度，不需要除以100
+    // 注意：这是有符号整数，负值表示反方向
     int16_t rawAzimuth = (int16_t)swapEndian16((uint16_t)frame->azimuth);
     int16_t rawElevation = (int16_t)swapEndian16((uint16_t)frame->elevation);
     
-    posInfo->azimuth_deg = rawAzimuth / 100.0;
-    posInfo->elevation_deg = rawElevation / 100.0;
+    posInfo->azimuth_deg = (double)rawAzimuth;      // 方位角（度）
+    posInfo->elevation_deg = (double)rawElevation;  // 俯仰角（度）
     
-    // 将球坐标转换为笛卡尔坐标
+    // 将球坐标转换为笛卡尔坐标（单位：厘米）
     posInfo->coord = sphericalToCartesian(
-        (double)posInfo->distance_mm,
+        (double)posInfo->distance_cm,
         posInfo->azimuth_deg,
         posInfo->elevation_deg
     );
@@ -396,15 +451,16 @@ void printPositionInfo(const PositionInfo& posInfo) {
     std::cout << "========================================" << std::endl;
     std::cout << "【UWB定位数据】" << std::endl;
     std::cout << "----------------------------------------" << std::endl;
+    std::cout << "  基站ID:    0x" << std::hex << posInfo.anchorID << std::dec << std::endl;
     std::cout << "  信标ID:    0x" << std::hex << posInfo.tagID << std::dec << std::endl;
-    std::cout << "  距离:      " << posInfo.distance_mm << " mm" << std::endl;
+    std::cout << "  距离:      " << posInfo.distance_cm << " cm" << std::endl;
     std::cout << "  方位角:    " << posInfo.azimuth_deg << " 度" << std::endl;
     std::cout << "  俯仰角:    " << posInfo.elevation_deg << " 度" << std::endl;
     std::cout << "----------------------------------------" << std::endl;
-    std::cout << "【转换后坐标】" << std::endl;
-    std::cout << "  X (左右):  " << posInfo.coord.x << " mm" << std::endl;
-    std::cout << "  Y (前后):  " << posInfo.coord.y << " mm" << std::endl;
-    std::cout << "  Z (上下):  " << posInfo.coord.z << " mm" << std::endl;
+    std::cout << "【转换后坐标】（单位：厘米）" << std::endl;
+    std::cout << "  X (左右):  " << posInfo.coord.x << " cm" << std::endl;
+    std::cout << "  Y (前后):  " << posInfo.coord.y << " cm" << std::endl;
+    std::cout << "  Z (上下):  " << posInfo.coord.z << " cm" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << std::endl;
 }
