@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================================
-UWB单基站跟随套件 - 三维移动路径可视化程序
+UWB单基站跟随套件 - 二维平面移动路径可视化程序
 ============================================================================
 
 功能说明：
-    本程序从UWB基站接收串口数据，实时可视化显示信标的三维移动路径。
-    支持实时3D轨迹绘制、XYZ坐标显示、路径渐隐等功能。
+    本程序从UWB基站接收串口数据，实时可视化显示信标的移动路径。
+    使用三个二维平面视图：俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
 
 硬件连接：
     - UWB基站通过USB转TTL模块连接到电脑
@@ -44,8 +44,6 @@ except ImportError:
 try:
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
-    from matplotlib.patches import Circle, Arrow
-    from mpl_toolkits.mplot3d import Axes3D  # 三维绑图支持
     import numpy as np
 except ImportError:
     print("错误：请先安装 matplotlib 和 numpy 库")
@@ -62,10 +60,9 @@ FRAME_LENGTH = 37                    # 数据帧长度（字节）
 CMD_POSITION = 0x2001                # 位置数据命令字
 
 # 可视化配置
-MAX_PATH_POINTS = 100       # 最大保留路径点数（减少以缩短残留时间）
+MAX_PATH_POINTS = 100       # 最大保留路径点数
 UPDATE_INTERVAL = 50        # 图形更新间隔（毫秒）
-GRID_SIZE = 50              # 网格大小（厘米）
-DISPLAY_RANGE = 300         # 默认显示范围（厘米）
+DISPLAY_RANGE = 200         # 默认显示范围（厘米）
 PATH_FADE_TIME = 5.0        # 路径渐隐时间（秒）
 
 # ============================================================================
@@ -149,16 +146,27 @@ class UWBDataParser:
             
             # 解析数据（大端序）
             try:
-                # 命令字在第8-9字节
+                # 协议字段偏移量：
+                # MessageHeader:   0-3   (4字节)
+                # PacketLength:    4-5   (2字节)
+                # SequenceID:      6-7   (2字节)
+                # RequestCommand:  8-9   (2字节)
+                # VersionID:       10-11 (2字节)
+                # AnchorID:        12-15 (4字节)
+                # TagID:           16-19 (4字节)
+                # Distance:        20-23 (4字节)
+                # Azimuth:         24-25 (2字节)
+                # Elevation:       26-27 (2字节)
+                
                 command = struct.unpack('>H', frame[8:10])[0]
                 
                 if command == CMD_POSITION:
-                    # 解析各字段
-                    anchor_id = struct.unpack('>I', frame[14:18])[0]
-                    tag_id = struct.unpack('>I', frame[18:22])[0]
-                    distance_cm = struct.unpack('>I', frame[22:26])[0]
-                    azimuth_deg = struct.unpack('>h', frame[26:28])[0]  # 有符号
-                    elevation_deg = struct.unpack('>h', frame[28:30])[0]  # 有符号
+                    # 解析各字段（修正字节偏移）
+                    anchor_id = struct.unpack('>I', frame[12:16])[0]
+                    tag_id = struct.unpack('>I', frame[16:20])[0]
+                    distance_cm = struct.unpack('>I', frame[20:24])[0]
+                    azimuth_deg = struct.unpack('>h', frame[24:26])[0]  # 有符号
+                    elevation_deg = struct.unpack('>h', frame[26:28])[0]  # 有符号
                     
                     # 将球坐标转换为笛卡尔坐标
                     x, y, z = self.spherical_to_cartesian(
@@ -307,11 +315,11 @@ class SerialReceiver:
 
 
 # ============================================================================
-# 可视化类（三维版本）
+# 可视化类（三个二维平面版本）
 # ============================================================================
 
 class PathVisualizer:
-    """三维路径可视化器"""
+    """二维平面路径可视化器（三个视图）"""
     
     def __init__(self, receiver):
         """
@@ -339,84 +347,80 @@ class PathVisualizer:
         self.setup_plot()
     
     def setup_plot(self):
-        """设置三维图形界面"""
+        """设置三个二维平面图形界面"""
         # 设置中文字体支持
         plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
         plt.rcParams['axes.unicode_minus'] = False
         
-        # 创建图形和三维坐标轴
-        self.fig = plt.figure(figsize=(14, 10))
-        self.fig.canvas.manager.set_window_title('UWB 三维移动路径可视化')
+        # 创建2x2布局的图形
+        self.fig = plt.figure(figsize=(12, 10))
+        self.fig.canvas.manager.set_window_title('UWB 二维平面移动路径可视化')
         
-        # 创建三维子图（左侧，占主要位置）
-        self.ax3d = self.fig.add_subplot(121, projection='3d')
+        # 创建俯视图 (X-Y平面) - 左上
+        self.ax_xy = self.fig.add_subplot(221)
         
-        # 创建2D俯视图（右上）
-        self.ax_top = self.fig.add_subplot(222)
+        # 创建前视图 (X-Z平面) - 右上
+        self.ax_xz = self.fig.add_subplot(222)
         
-        # 创建2D侧视图（右下）
-        self.ax_side = self.fig.add_subplot(224)
+        # 创建侧视图 (Y-Z平面) - 左下
+        self.ax_yz = self.fig.add_subplot(223)
         
-        # 设置三维坐标轴
-        self.ax3d.set_xlim(-DISPLAY_RANGE, DISPLAY_RANGE)
-        self.ax3d.set_ylim(-DISPLAY_RANGE, DISPLAY_RANGE)
-        self.ax3d.set_zlim(-DISPLAY_RANGE/2, DISPLAY_RANGE/2)
-        self.ax3d.set_xlabel('X (cm) - 左右', fontsize=10)
-        self.ax3d.set_ylabel('Y (cm) - 前后', fontsize=10)
-        self.ax3d.set_zlabel('Z (cm) - 上下', fontsize=10)
-        self.ax3d.set_title('三维路径视图', fontsize=12, fontweight='bold')
+        # ==================== 俯视图 (X-Y平面) ====================
+        self.ax_xy.set_xlim(-DISPLAY_RANGE, DISPLAY_RANGE)
+        self.ax_xy.set_ylim(-DISPLAY_RANGE, DISPLAY_RANGE)
+        self.ax_xy.set_aspect('equal')
+        self.ax_xy.grid(True, linestyle='--', alpha=0.5)
+        self.ax_xy.set_xlabel('X (cm) - 左右', fontsize=10)
+        self.ax_xy.set_ylabel('Y (cm) - 前后', fontsize=10)
+        self.ax_xy.set_title('俯视图 (X-Y平面)', fontsize=12, fontweight='bold')
+        self.ax_xy.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        self.ax_xy.axvline(x=0, color='gray', linestyle='-', alpha=0.3)
+        self.ax_xy.plot(0, 0, 'rs', markersize=12, label='基站')
+        self.path_line_xy, = self.ax_xy.plot([], [], 'b-', linewidth=2, alpha=0.7, label='轨迹')
+        self.current_point_xy, = self.ax_xy.plot([], [], 'go', markersize=10, label='当前')
+        self.ax_xy.legend(loc='upper right', fontsize=9)
         
-        # 绘制基站位置（原点）- 三维
-        self.ax3d.scatter([0], [0], [0], c='red', s=200, marker='s', label='基站', depthshade=False)
+        # ==================== 前视图 (X-Z平面) ====================
+        self.ax_xz.set_xlim(-DISPLAY_RANGE, DISPLAY_RANGE)
+        self.ax_xz.set_ylim(-DISPLAY_RANGE/2, DISPLAY_RANGE/2)
+        self.ax_xz.grid(True, linestyle='--', alpha=0.5)
+        self.ax_xz.set_xlabel('X (cm) - 左右', fontsize=10)
+        self.ax_xz.set_ylabel('Z (cm) - 上下', fontsize=10)
+        self.ax_xz.set_title('前视图 (X-Z平面)', fontsize=12, fontweight='bold')
+        self.ax_xz.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        self.ax_xz.axvline(x=0, color='gray', linestyle='-', alpha=0.3)
+        self.ax_xz.plot(0, 0, 'rs', markersize=12)
+        self.path_line_xz, = self.ax_xz.plot([], [], 'b-', linewidth=2, alpha=0.7)
+        self.current_point_xz, = self.ax_xz.plot([], [], 'go', markersize=10)
         
-        # 绘制坐标轴参考线
-        self.ax3d.plot([-DISPLAY_RANGE, DISPLAY_RANGE], [0, 0], [0, 0], 'r--', alpha=0.3)
-        self.ax3d.plot([0, 0], [-DISPLAY_RANGE, DISPLAY_RANGE], [0, 0], 'g--', alpha=0.3)
-        self.ax3d.plot([0, 0], [0, 0], [-DISPLAY_RANGE/2, DISPLAY_RANGE/2], 'b--', alpha=0.3)
+        # ==================== 侧视图 (Y-Z平面) ====================
+        self.ax_yz.set_xlim(-DISPLAY_RANGE, DISPLAY_RANGE)
+        self.ax_yz.set_ylim(-DISPLAY_RANGE/2, DISPLAY_RANGE/2)
+        self.ax_yz.grid(True, linestyle='--', alpha=0.5)
+        self.ax_yz.set_xlabel('Y (cm) - 前后', fontsize=10)
+        self.ax_yz.set_ylabel('Z (cm) - 上下', fontsize=10)
+        self.ax_yz.set_title('侧视图 (Y-Z平面)', fontsize=12, fontweight='bold')
+        self.ax_yz.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        self.ax_yz.axvline(x=0, color='gray', linestyle='-', alpha=0.3)
+        self.ax_yz.plot(0, 0, 'rs', markersize=12)
+        self.path_line_yz, = self.ax_yz.plot([], [], 'b-', linewidth=2, alpha=0.7)
+        self.current_point_yz, = self.ax_yz.plot([], [], 'go', markersize=10)
         
-        # 创建三维路径线和当前位置点
-        self.path_line_3d, = self.ax3d.plot([], [], [], 'b-', linewidth=2, alpha=0.8, label='移动路径')
-        self.current_point_3d = self.ax3d.scatter([], [], [], c='lime', s=150, marker='o', 
-                                                   label='当前位置', depthshade=False, edgecolors='darkgreen', linewidths=2)
-        
-        self.ax3d.legend(loc='upper left', fontsize=9)
-        
-        # 设置俯视图 (X-Y平面)
-        self.ax_top.set_xlim(-DISPLAY_RANGE, DISPLAY_RANGE)
-        self.ax_top.set_ylim(-DISPLAY_RANGE, DISPLAY_RANGE)
-        self.ax_top.set_aspect('equal')
-        self.ax_top.grid(True, linestyle='--', alpha=0.5)
-        self.ax_top.set_xlabel('X (cm)', fontsize=10)
-        self.ax_top.set_ylabel('Y (cm)', fontsize=10)
-        self.ax_top.set_title('俯视图 (X-Y平面)', fontsize=11, fontweight='bold')
-        self.ax_top.plot(0, 0, 'rs', markersize=10)
-        self.path_line_top, = self.ax_top.plot([], [], 'b-', linewidth=1.5, alpha=0.7)
-        self.current_point_top, = self.ax_top.plot([], [], 'go', markersize=10)
-        
-        # 设置侧视图 (Y-Z平面)
-        self.ax_side.set_xlim(-DISPLAY_RANGE, DISPLAY_RANGE)
-        self.ax_side.set_ylim(-DISPLAY_RANGE/2, DISPLAY_RANGE/2)
-        self.ax_side.grid(True, linestyle='--', alpha=0.5)
-        self.ax_side.set_xlabel('Y (cm) - 前后', fontsize=10)
-        self.ax_side.set_ylabel('Z (cm) - 上下', fontsize=10)
-        self.ax_side.set_title('侧视图 (Y-Z平面)', fontsize=11, fontweight='bold')
-        self.ax_side.plot(0, 0, 'rs', markersize=10)
-        self.path_line_side, = self.ax_side.plot([], [], 'b-', linewidth=1.5, alpha=0.7)
-        self.current_point_side, = self.ax_side.plot([], [], 'go', markersize=10)
-        
-        # 创建信息文本框
+        # 创建信息文本框 - 右下
+        self.ax_info = self.fig.add_subplot(224)
+        self.ax_info.axis('off')
         info_text = "等待数据..."
-        self.info_box = self.fig.text(
-            0.52, 0.48, info_text,
-            fontsize=10,
+        self.info_box = self.ax_info.text(
+            0.1, 0.9, info_text,
+            fontsize=11,
             verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9),
-            family='monospace'
+            family='monospace',
+            transform=self.ax_info.transAxes
         )
         
         # 紧凑布局
         plt.tight_layout()
-        plt.subplots_adjust(wspace=0.3)
     
     def update(self, frame):
         """
@@ -456,52 +460,57 @@ class PathVisualizer:
             path_y = [p[1] for p in self.path_data]
             path_z = [p[2] for p in self.path_data]
             
-            # 更新三维路径线
-            self.path_line_3d.set_data(path_x, path_y)
-            self.path_line_3d.set_3d_properties(path_z)
+            # 更新俯视图路径 (X-Y)
+            self.path_line_xy.set_data(path_x, path_y)
             
-            # 更新俯视图路径
-            self.path_line_top.set_data(path_x, path_y)
+            # 更新前视图路径 (X-Z)
+            self.path_line_xz.set_data(path_x, path_z)
             
-            # 更新侧视图路径
-            self.path_line_side.set_data(path_y, path_z)
+            # 更新侧视图路径 (Y-Z)
+            self.path_line_yz.set_data(path_y, path_z)
         
         # 更新当前位置点
         if self.current_pos:
             x, y, z = self.current_pos
             
-            # 更新三维当前位置
-            self.current_point_3d._offsets3d = ([x], [y], [z])
-            
             # 更新俯视图当前位置
-            self.current_point_top.set_data([x], [y])
+            self.current_point_xy.set_data([x], [y])
+            
+            # 更新前视图当前位置
+            self.current_point_xz.set_data([x], [z])
             
             # 更新侧视图当前位置
-            self.current_point_side.set_data([y], [z])
+            self.current_point_yz.set_data([y], [z])
         
         # 更新信息文本
         if self.current_pos:
             info_text = (
-                f"━━━━━ 实时数据 ━━━━━\n"
-                f"数据点数: {self.data_count}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"距离:   {self.last_distance:6d} cm\n"
-                f"方位角: {self.last_azimuth:6d}°\n"
-                f"仰角:   {self.last_elevation:6d}°\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"X坐标:  {self.last_x:8.1f} cm\n"
-                f"Y坐标:  {self.last_y:8.1f} cm\n"
-                f"Z坐标:  {self.last_z:8.1f} cm\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"路径点: {len(self.path_data):3d}/{MAX_PATH_POINTS}\n"
-                f"残留:   {PATH_FADE_TIME:.1f}秒"
+                f"━━━━━━ 实时数据 ━━━━━━\n\n"
+                f"  数据点数:  {self.data_count}\n\n"
+                f"━━━━━ 原始数据 ━━━━━\n\n"
+                f"  距离:      {self.last_distance:6d} cm\n"
+                f"  方位角:    {self.last_azimuth:6d}°\n"
+                f"  仰角:      {self.last_elevation:6d}°\n\n"
+                f"━━━━━ 转换坐标 ━━━━━\n\n"
+                f"  X坐标:     {self.last_x:8.1f} cm\n"
+                f"  Y坐标:     {self.last_y:8.1f} cm\n"
+                f"  Z坐标:     {self.last_z:8.1f} cm\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"  路径点:    {len(self.path_data):3d}/{MAX_PATH_POINTS}\n"
+                f"  残留时间:  {PATH_FADE_TIME:.1f}秒"
             )
         else:
-            info_text = "等待数据...\n\n请确保：\n1. 串口已正确连接\n2. 基站已上电\n3. 信标在范围内"
+            info_text = (
+                "等待数据...\n\n"
+                "请确保：\n"
+                "1. 串口已正确连接\n"
+                "2. 基站已上电\n"
+                "3. 信标在范围内"
+            )
         
         self.info_box.set_text(info_text)
         
-        # 自动调整三维显示范围
+        # 自动调整显示范围
         if len(self.path_data) > 0:
             path_x = [p[0] for p in self.path_data]
             path_y = [p[1] for p in self.path_data]
@@ -509,22 +518,22 @@ class PathVisualizer:
             
             x_range = max(abs(min(path_x)), abs(max(path_x)), 50) * 1.3
             y_range = max(abs(min(path_y)), abs(max(path_y)), 50) * 1.3
-            z_range = max(abs(min(path_z)), abs(max(path_z)), 30) * 1.5
+            z_range = max(abs(min(path_z)), abs(max(path_z)), 20) * 1.5
             
             max_xy_range = max(x_range, y_range, DISPLAY_RANGE)
             max_z_range = max(z_range, DISPLAY_RANGE/4)
             
-            self.ax3d.set_xlim(-max_xy_range, max_xy_range)
-            self.ax3d.set_ylim(-max_xy_range, max_xy_range)
-            self.ax3d.set_zlim(-max_z_range, max_z_range)
+            # 更新各视图范围
+            self.ax_xy.set_xlim(-max_xy_range, max_xy_range)
+            self.ax_xy.set_ylim(-max_xy_range, max_xy_range)
             
-            # 更新2D视图范围
-            self.ax_top.set_xlim(-max_xy_range, max_xy_range)
-            self.ax_top.set_ylim(-max_xy_range, max_xy_range)
-            self.ax_side.set_xlim(-max_xy_range, max_xy_range)
-            self.ax_side.set_ylim(-max_z_range, max_z_range)
+            self.ax_xz.set_xlim(-max_xy_range, max_xy_range)
+            self.ax_xz.set_ylim(-max_z_range, max_z_range)
+            
+            self.ax_yz.set_xlim(-max_xy_range, max_xy_range)
+            self.ax_yz.set_ylim(-max_z_range, max_z_range)
         
-        return self.path_line_3d, self.current_point_3d, self.info_box
+        return self.path_line_xy, self.current_point_xy, self.info_box
     
     def run(self):
         """运行可视化"""
@@ -538,10 +547,11 @@ class PathVisualizer:
         )
         
         # 显示窗口
-        print("\n✓ 三维可视化窗口已打开")
-        print("  - 左侧：三维路径视图（可拖拽旋转）")
-        print("  - 右上：俯视图 (X-Y平面)")
-        print("  - 右下：侧视图 (Y-Z平面)")
+        print("\n✓ 二维平面可视化窗口已打开")
+        print("  - 左上：俯视图 (X-Y平面)")
+        print("  - 右上：前视图 (X-Z平面)")
+        print("  - 左下：侧视图 (Y-Z平面)")
+        print("  - 右下：实时数据信息")
         print("  - 绿色圆点：当前位置")
         print("  - 蓝色线条：移动路径")
         print("  - 红色方块：基站位置")
@@ -556,14 +566,14 @@ class PathVisualizer:
 # ============================================================================
 
 class SimulatedReceiver:
-    """模拟数据接收器（用于无硬件时测试三维轨迹）"""
+    """模拟数据接收器（用于无硬件时测试）"""
     
     def __init__(self):
         self.data_queue = deque(maxlen=100)
         self.running = False
         self.thread = None
         self.angle = 0
-        self.radius = 50
+        self.radius = 30  # 起始半径（厘米）
         self.z_angle = 0
     
     def connect(self):
@@ -579,15 +589,15 @@ class SimulatedReceiver:
         self.running = True
         self.thread = threading.Thread(target=self._generate_loop, daemon=True)
         self.thread.start()
-        print("✓ 开始生成模拟数据（三维螺旋轨迹）...")
+        print("✓ 开始生成模拟数据（螺旋轨迹）...")
         return True
     
     def _generate_loop(self):
-        """生成模拟三维数据"""
+        """生成模拟数据"""
         while self.running:
-            # 生成三维螺旋线轨迹
+            # 生成螺旋线轨迹
             self.angle += 8
-            self.radius += 0.3
+            self.radius += 0.2
             self.z_angle += 3  # Z轴周期性变化
             
             # 添加一些随机噪声
@@ -599,8 +609,8 @@ class SimulatedReceiver:
             x = self.radius * math.sin(math.radians(self.angle)) + noise_x
             y = self.radius * math.cos(math.radians(self.angle)) + noise_y
             
-            # 计算Z坐标（正弦波动 + 缓慢上升）
-            z = 30 * math.sin(math.radians(self.z_angle)) + self.radius * 0.1 + noise_z
+            # 计算Z坐标（正弦波动，范围约±15cm）
+            z = 15 * math.sin(math.radians(self.z_angle)) + noise_z
             
             # 计算距离和角度
             distance = math.sqrt(x*x + y*y + z*z)
