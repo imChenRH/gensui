@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================================
-UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序
+UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序（改进版）
 ============================================================================
 
 功能说明：
@@ -10,6 +10,15 @@ UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序
     使用六个二维平面视图进行对比：
     - 上排：原始数据的俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
     - 下排：滤波后数据的俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
+
+改进版滤波算法（三步滤波流程）：
+    Step 1 (物理约束检查): 检测数据是否在物理可能的范围内
+        - 绝对范围限制（距离、角度）
+        - 速度限制（位置变化不能超过物理可能的速度）
+    Step 2 (中位数滤波): 使用窗口为5的中位数滤波消除尖峰异常
+        - 对距离、方位角、仰角、X、Y、Z分别进行中位数滤波
+        - 方位角使用角度归一化处理0°/360°边界
+    Step 3 (卡尔曼滤波平滑): 使用卡尔曼滤波进行最终平滑
 
 硬件连接：
     - UWB基站通过USB转TTL模块连接到电脑
@@ -24,6 +33,10 @@ UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序
     
     模拟模式（含异常值）：
     python uwb_filtered_visualizer.py --simulate
+    
+参考资料：
+    - "Probabilistic Robotics" (Thrun, Burgard, Fox)
+    - scipy.signal (medfilt, lfilter)
     
 作者：Copilot
 日期：2026-01-22
@@ -71,6 +84,26 @@ MAX_PATH_POINTS = 100       # 最大保留路径点数
 UPDATE_INTERVAL = 50        # 图形更新间隔（毫秒）
 DISPLAY_RANGE = 200         # 默认显示范围（厘米）
 PATH_FADE_TIME = 5.0        # 路径渐隐时间（秒）
+
+# ============================================================================
+# 物理约束参数（用于机器狗跟随场景）
+# ============================================================================
+# 距离约束（单位：厘米）
+MIN_DISTANCE = 5            # 最小有效距离
+MAX_DISTANCE = 5000         # 最大有效距离（50米）
+
+# 角度约束（单位：度）
+MIN_AZIMUTH = -180          # 方位角最小值
+MAX_AZIMUTH = 180           # 方位角最大值
+MIN_ELEVATION = -90         # 仰角最小值（向下看）
+MAX_ELEVATION = 90          # 仰角最大值（向上看）
+
+# 速度约束（单位：厘米/秒）
+# 人正常行走约 120cm/s，快走约 200cm/s，小跑约 300cm/s
+MAX_VELOCITY = 300          # 最大允许速度
+
+# 中位数滤波窗口大小（必须为奇数）
+MEDIAN_WINDOW_SIZE = 5
 
 
 # ============================================================================
@@ -130,145 +163,512 @@ class KalmanFilter3D:
 
 
 # ============================================================================
-# 异常值检测器
+# 中位数滤波器（消除尖峰异常值的"银弹"）
 # ============================================================================
 
-class OutlierDetector:
-    """异常值检测器"""
+class MedianFilter:
+    """
+    中位数滤波器 - 最有效的尖峰消除方法
     
-    def __init__(self, 
-                 max_velocity: float = 200.0,
-                 max_distance_jump: float = 50.0):
-        self.max_velocity = max_velocity
-        self.max_distance_jump = max_distance_jump
+    原理：保持最近N个读数的缓冲区，排序后取中间值。
+    优点：完全忽略异常尖峰，不会像平均值那样被异常值拉偏。
+    """
+    
+    def __init__(self, window_size: int = 5):
+        """
+        初始化中位数滤波器
         
-        self.last_position = None
-        self.last_time = None
-        self.last_distance = None
+        Args:
+            window_size: 窗口大小（必须为奇数，如3或5）
+        """
+        # 确保窗口大小为奇数
+        if window_size % 2 == 0:
+            window_size += 1
+        self.window_size = window_size
+        self.buffer = deque(maxlen=window_size)
     
-    def is_outlier_by_velocity(self, x: float, y: float, z: float, 
-                                current_time: float = None) -> bool:
+    def filter(self, value: float) -> float:
+        """
+        对新值进行中位数滤波
+        
+        Args:
+            value: 新的测量值
+            
+        Returns:
+            中位数滤波后的值
+        """
+        self.buffer.append(value)
+        
+        # 数据不足时直接返回当前值
+        if len(self.buffer) < self.window_size:
+            return value
+        
+        # 返回中位数（中间值）
+        return statistics.median(self.buffer)
+    
+    def reset(self):
+        """重置滤波器状态"""
+        self.buffer.clear()
+
+
+class AngleMedianFilter:
+    """
+    角度中位数滤波器 - 处理0°/360°边界问题
+    
+    警告：处理方位角（航向）时需要特别注意环绕问题。
+    1°和359°的平均值应该是0°，而不是180°。
+    必须在滤波前对角度进行归一化处理。
+    """
+    
+    def __init__(self, window_size: int = 5):
+        """
+        初始化角度中位数滤波器
+        
+        Args:
+            window_size: 窗口大小（必须为奇数）
+        """
+        if window_size % 2 == 0:
+            window_size += 1
+        self.window_size = window_size
+        self.buffer = deque(maxlen=window_size)
+    
+    @staticmethod
+    def normalize_angle(angle: float) -> float:
+        """
+        将角度归一化到 [-180, 180) 范围
+        
+        Args:
+            angle: 输入角度（度）
+            
+        Returns:
+            归一化后的角度
+        """
+        while angle >= 180:
+            angle -= 360
+        while angle < -180:
+            angle += 360
+        return angle
+    
+    @staticmethod
+    def angle_difference(a1: float, a2: float) -> float:
+        """
+        计算两个角度之间的最短差值
+        
+        Args:
+            a1: 第一个角度
+            a2: 第二个角度
+            
+        Returns:
+            角度差（-180到180之间）
+        """
+        diff = a1 - a2
+        while diff > 180:
+            diff -= 360
+        while diff < -180:
+            diff += 360
+        return diff
+    
+    def filter(self, angle: float) -> float:
+        """
+        对角度进行中位数滤波（处理环绕问题）
+        
+        Args:
+            angle: 新的角度测量值（度）
+            
+        Returns:
+            中位数滤波后的角度
+        """
+        normalized_angle = self.normalize_angle(angle)
+        self.buffer.append(normalized_angle)
+        
+        if len(self.buffer) < self.window_size:
+            return normalized_angle
+        
+        # 使用参考角度方法处理环绕问题
+        # 以第一个值为参考，计算其他值相对于它的差值
+        ref_angle = self.buffer[0]
+        differences = []
+        
+        for a in self.buffer:
+            diff = self.angle_difference(a, ref_angle)
+            differences.append(diff)
+        
+        # 对差值取中位数，然后加回参考角度
+        median_diff = statistics.median(differences)
+        result = self.normalize_angle(ref_angle + median_diff)
+        
+        return result
+    
+    def reset(self):
+        """重置滤波器状态"""
+        self.buffer.clear()
+
+
+# ============================================================================
+# 物理约束滤波器（Range Gating）
+# ============================================================================
+
+class PhysicalConstraintFilter:
+    """
+    物理约束滤波器 - 基于物理规则拒绝不可能的数据
+    
+    由于机器狗是物理机器人，关节和传感器有物理极限。
+    可以硬编码这些物理规则来拒绝不可能的数据。
+    
+    检查项目：
+    1. 绝对限制：如果数据超出物理可能的范围，则为无效
+    2. 速度限制：如果位置变化暗示的速度超过物理可能，则为无效
+    """
+    
+    def __init__(self,
+                 min_distance: float = MIN_DISTANCE,
+                 max_distance: float = MAX_DISTANCE,
+                 min_azimuth: float = MIN_AZIMUTH,
+                 max_azimuth: float = MAX_AZIMUTH,
+                 min_elevation: float = MIN_ELEVATION,
+                 max_elevation: float = MAX_ELEVATION,
+                 max_velocity: float = MAX_VELOCITY):
+        """
+        初始化物理约束滤波器
+        
+        Args:
+            min_distance: 最小有效距离（厘米）
+            max_distance: 最大有效距离（厘米）
+            min_azimuth: 最小方位角（度）
+            max_azimuth: 最大方位角（度）
+            min_elevation: 最小仰角（度）
+            max_elevation: 最大仰角（度）
+            max_velocity: 最大允许速度（厘米/秒）
+        """
+        self.min_distance = min_distance
+        self.max_distance = max_distance
+        self.min_azimuth = min_azimuth
+        self.max_azimuth = max_azimuth
+        self.min_elevation = min_elevation
+        self.max_elevation = max_elevation
+        self.max_velocity = max_velocity
+        
+        # 上一次有效数据
+        self.last_valid_position = None
+        self.last_valid_time = None
+        self.last_valid_data = None
+        
+        # 统计
+        self.reject_count_range = 0      # 超出范围拒绝
+        self.reject_count_velocity = 0   # 超出速度拒绝
+    
+    def check_range_constraints(self, distance: float, azimuth: float, elevation: float) -> bool:
+        """
+        检查数据是否在物理可能的范围内
+        
+        Args:
+            distance: 距离（厘米）
+            azimuth: 方位角（度）
+            elevation: 仰角（度）
+            
+        Returns:
+            True 如果数据在有效范围内，False 如果超出范围
+        """
+        # 检查距离范围
+        if distance < self.min_distance or distance > self.max_distance:
+            return False
+        
+        # 检查方位角范围（归一化后检查）
+        normalized_azimuth = AngleMedianFilter.normalize_angle(azimuth)
+        if normalized_azimuth < self.min_azimuth or normalized_azimuth > self.max_azimuth:
+            return False
+        
+        # 检查仰角范围
+        if elevation < self.min_elevation or elevation > self.max_elevation:
+            return False
+        
+        return True
+    
+    def check_velocity_constraint(self, x: float, y: float, z: float, 
+                                   current_time: float = None) -> bool:
+        """
+        检查位置变化是否符合速度约束
+        
+        如果 angle_t 和 angle_t-1 之间的变化暗示速度为 5000°/秒，
+        那么新数据点是无效的。
+        
+        Args:
+            x, y, z: 当前位置（厘米）
+            current_time: 当前时间戳
+            
+        Returns:
+            True 如果速度在允许范围内，False 如果超出速度限制
+        """
         if current_time is None:
             current_time = time.time()
         
-        if self.last_position is None or self.last_time is None:
-            self.last_position = (x, y, z)
-            self.last_time = current_time
-            return False
+        # 第一个数据点总是有效的
+        if self.last_valid_position is None or self.last_valid_time is None:
+            return True
         
-        dx = x - self.last_position[0]
-        dy = y - self.last_position[1]
-        dz = z - self.last_position[2]
-        distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+        # 计算位移
+        dx = x - self.last_valid_position[0]
+        dy = y - self.last_valid_position[1]
+        dz = z - self.last_valid_position[2]
+        displacement = math.sqrt(dx*dx + dy*dy + dz*dz)
         
-        dt = current_time - self.last_time
+        # 计算时间差
+        dt = current_time - self.last_valid_time
         if dt <= 0:
-            dt = 0.01
+            dt = 0.01  # 避免除以零
         
-        velocity = distance / dt
-        is_outlier = velocity > self.max_velocity
+        # 计算速度
+        velocity = displacement / dt
         
-        if not is_outlier:
-            self.last_position = (x, y, z)
-            self.last_time = current_time
-        
-        return is_outlier
+        # 检查速度是否在允许范围内
+        return velocity <= self.max_velocity
     
-    def is_outlier_by_distance_jump(self, distance: float) -> bool:
-        if self.last_distance is None:
-            self.last_distance = distance
-            return False
+    def filter(self, distance: float, azimuth: float, elevation: float,
+               x: float, y: float, z: float,
+               current_time: float = None) -> dict:
+        """
+        对数据进行物理约束检查
         
-        jump = abs(distance - self.last_distance)
-        is_outlier = jump > self.max_distance_jump
+        Args:
+            distance: 距离（厘米）
+            azimuth: 方位角（度）
+            elevation: 仰角（度）
+            x, y, z: 笛卡尔坐标（厘米）
+            current_time: 时间戳
+            
+        Returns:
+            字典包含:
+            - 'valid': 数据是否有效
+            - 'reject_reason': 拒绝原因（如果无效）
+            - 原始数据字段
+        """
+        if current_time is None:
+            current_time = time.time()
         
-        if not is_outlier:
-            self.last_distance = distance
+        result = {
+            'distance': distance,
+            'azimuth': azimuth,
+            'elevation': elevation,
+            'x': x, 'y': y, 'z': z,
+            'valid': True,
+            'reject_reason': None
+        }
         
-        return is_outlier
+        # Step 1: 检查范围约束
+        if not self.check_range_constraints(distance, azimuth, elevation):
+            result['valid'] = False
+            result['reject_reason'] = 'range'
+            self.reject_count_range += 1
+            
+            # 如果有上一次有效数据，使用它
+            if self.last_valid_data:
+                return {**self.last_valid_data, 'valid': False, 'reject_reason': 'range'}
+            return result
+        
+        # Step 2: 检查速度约束
+        if not self.check_velocity_constraint(x, y, z, current_time):
+            result['valid'] = False
+            result['reject_reason'] = 'velocity'
+            self.reject_count_velocity += 1
+            
+            # 如果有上一次有效数据，使用它
+            if self.last_valid_data:
+                return {**self.last_valid_data, 'valid': False, 'reject_reason': 'velocity'}
+            return result
+        
+        # 数据有效，更新上一次有效数据
+        self.last_valid_position = (x, y, z)
+        self.last_valid_time = current_time
+        self.last_valid_data = result.copy()
+        
+        return result
+    
+    def get_statistics(self) -> dict:
+        """获取统计信息"""
+        return {
+            'reject_count_range': self.reject_count_range,
+            'reject_count_velocity': self.reject_count_velocity,
+            'total_rejected': self.reject_count_range + self.reject_count_velocity
+        }
     
     def reset(self):
-        self.last_position = None
-        self.last_time = None
-        self.last_distance = None
+        """重置滤波器状态"""
+        self.last_valid_position = None
+        self.last_valid_time = None
+        self.last_valid_data = None
+        self.reject_count_range = 0
+        self.reject_count_velocity = 0
 
 
 # ============================================================================
-# 综合数据滤波器
+# 综合数据滤波器（三步滤波流程）
 # ============================================================================
 
 class UWBDataFilter:
-    """UWB数据综合滤波器"""
+    """
+    UWB数据综合滤波器 - 实现机器狗传感器数据滤波的完整流程
+    
+    三步滤波流程：
+        Step 1 (物理约束检查): 应用物理约束滤波
+            - 如果传感器说头部朝向后方（但物理上不可能），丢弃该帧
+            - 使用上一个有效值
+        
+        Step 2 (去尖峰): 将有效数据通过中位数滤波器（窗口大小3或5）
+            - 这能消除随机的"毛刺"
+        
+        Step 3 (平滑): 如果数据仍然抖动，通过卡尔曼滤波或移动平均
+    
+    参考：《Probabilistic Robotics》 (Thrun, Burgard, Fox)
+    """
     
     def __init__(self,
-                 max_velocity: float = 200.0,
-                 max_distance_jump: float = 50.0,
+                 # 物理约束参数
+                 min_distance: float = MIN_DISTANCE,
+                 max_distance: float = MAX_DISTANCE,
+                 max_velocity: float = MAX_VELOCITY,
+                 # 中位数滤波参数
+                 median_window: int = MEDIAN_WINDOW_SIZE,
+                 # 卡尔曼滤波参数
                  kalman_q: float = 0.1,
                  kalman_r: float = 0.5):
+        """
+        初始化综合滤波器
         
-        self.outlier_detector = OutlierDetector(
-            max_velocity=max_velocity,
-            max_distance_jump=max_distance_jump
+        Args:
+            min_distance: 最小有效距离
+            max_distance: 最大有效距离
+            max_velocity: 最大允许速度
+            median_window: 中位数滤波窗口大小
+            kalman_q: 卡尔曼过程噪声（越大响应越快）
+            kalman_r: 卡尔曼测量噪声（越大越平滑）
+        """
+        # ===== Step 1: 物理约束滤波器 =====
+        self.physical_filter = PhysicalConstraintFilter(
+            min_distance=min_distance,
+            max_distance=max_distance,
+            max_velocity=max_velocity
         )
         
-        self.kalman_filter = KalmanFilter3D(q=kalman_q, r=kalman_r)
-        self.distance_kalman = KalmanFilter1D(q=kalman_q, r=kalman_r)
+        # ===== Step 2: 中位数滤波器（对各个参数分别滤波） =====
+        self.median_distance = MedianFilter(median_window)
+        self.median_azimuth = AngleMedianFilter(median_window)  # 角度特殊处理
+        self.median_elevation = MedianFilter(median_window)
+        self.median_x = MedianFilter(median_window)
+        self.median_y = MedianFilter(median_window)
+        self.median_z = MedianFilter(median_window)
         
+        # ===== Step 3: 卡尔曼滤波器（最终平滑） =====
+        self.kalman_filter = KalmanFilter3D(q=kalman_q, r=kalman_r)
+        self.kalman_distance = KalmanFilter1D(q=kalman_q, r=kalman_r)
+        
+        # 统计信息
         self.total_count = 0
         self.outlier_count = 0
+        self.reject_count_range = 0
+        self.reject_count_velocity = 0
+        
+        # 最后有效数据
         self.last_valid_data = None
     
-    def filter(self, distance: float, x: float, y: float, z: float,
-               current_time: float = None) -> Optional[Dict]:
+    def filter(self, distance: float, azimuth: float, elevation: float,
+               x: float, y: float, z: float,
+               current_time: float = None) -> dict:
+        """
+        执行三步滤波流程
         
+        Args:
+            distance: 原始距离（厘米）
+            azimuth: 原始方位角（度）
+            elevation: 原始仰角（度）
+            x, y, z: 原始笛卡尔坐标（厘米）
+            current_time: 时间戳
+            
+        Returns:
+            滤波后的数据字典，包含 'is_outlier' 标志
+        """
         if current_time is None:
             current_time = time.time()
         
         self.total_count += 1
         
-        is_outlier = False
+        # ========== Step 1: 物理约束检查 ==========
+        physical_result = self.physical_filter.filter(
+            distance, azimuth, elevation, x, y, z, current_time
+        )
         
-        if self.outlier_detector.is_outlier_by_distance_jump(distance):
-            is_outlier = True
-        
-        if not is_outlier and self.outlier_detector.is_outlier_by_velocity(x, y, z, current_time):
-            is_outlier = True
-        
-        if is_outlier:
+        if not physical_result['valid']:
             self.outlier_count += 1
+            if physical_result['reject_reason'] == 'range':
+                self.reject_count_range += 1
+            elif physical_result['reject_reason'] == 'velocity':
+                self.reject_count_velocity += 1
+            
+            # 返回上一次有效数据（如果有）
             if self.last_valid_data:
-                return {**self.last_valid_data, 'is_outlier': True}
+                return {**self.last_valid_data, 'is_outlier': True, 
+                        'reject_reason': physical_result['reject_reason']}
             return None
         
-        filtered_x, filtered_y, filtered_z = self.kalman_filter.update(x, y, z)
-        filtered_distance = self.distance_kalman.update(distance)
+        # ========== Step 2: 中位数滤波（去尖峰） ==========
+        median_distance = self.median_distance.filter(distance)
+        median_azimuth = self.median_azimuth.filter(azimuth)
+        median_elevation = self.median_elevation.filter(elevation)
+        median_x = self.median_x.filter(x)
+        median_y = self.median_y.filter(y)
+        median_z = self.median_z.filter(z)
         
+        # ========== Step 3: 卡尔曼滤波（平滑） ==========
+        kalman_x, kalman_y, kalman_z = self.kalman_filter.update(
+            median_x, median_y, median_z
+        )
+        kalman_distance = self.kalman_distance.update(median_distance)
+        
+        # 构建结果
         result = {
-            'distance': round(filtered_distance, 2),
-            'x': round(filtered_x, 2),
-            'y': round(filtered_y, 2),
-            'z': round(filtered_z, 2),
-            'is_outlier': False
+            'distance': round(kalman_distance, 2),
+            'azimuth': round(median_azimuth, 2),
+            'elevation': round(median_elevation, 2),
+            'x': round(kalman_x, 2),
+            'y': round(kalman_y, 2),
+            'z': round(kalman_z, 2),
+            'is_outlier': False,
+            'reject_reason': None,
+            # 中间结果（用于调试）
+            'median_x': round(median_x, 2),
+            'median_y': round(median_y, 2),
+            'median_z': round(median_z, 2)
         }
         
         self.last_valid_data = result.copy()
         return result
     
-    def get_statistics(self) -> Dict:
+    def get_statistics(self) -> dict:
+        """获取滤波统计信息"""
         outlier_rate = self.outlier_count / self.total_count if self.total_count > 0 else 0
         return {
             'total_count': self.total_count,
             'outlier_count': self.outlier_count,
             'valid_count': self.total_count - self.outlier_count,
-            'outlier_rate': f"{outlier_rate * 100:.1f}%"
+            'outlier_rate': f"{outlier_rate * 100:.1f}%",
+            'reject_range': self.reject_count_range,
+            'reject_velocity': self.reject_count_velocity
         }
     
     def reset(self):
-        self.outlier_detector.reset()
+        """重置所有滤波器状态"""
+        self.physical_filter.reset()
+        self.median_distance.reset()
+        self.median_azimuth.reset()
+        self.median_elevation.reset()
+        self.median_x.reset()
+        self.median_y.reset()
+        self.median_z.reset()
         self.kalman_filter.reset()
-        self.distance_kalman.reset()
+        self.kalman_distance.reset()
         self.total_count = 0
         self.outlier_count = 0
+        self.reject_count_range = 0
+        self.reject_count_velocity = 0
         self.last_valid_data = None
 
 
@@ -518,17 +918,22 @@ class SimulatedReceiver:
 # ============================================================================
 
 class FilteredPathVisualizer:
-    """原始数据与滤波数据对比可视化器"""
+    """原始数据与滤波数据对比可视化器（改进版三步滤波）"""
     
     def __init__(self, receiver):
         self.receiver = receiver
         
-        # 滤波器
+        # 改进版滤波器（三步滤波流程）
         self.data_filter = UWBDataFilter(
-            max_velocity=250.0,        # 最大速度
-            max_distance_jump=60.0,    # 最大距离跳变
-            kalman_q=0.5,              # 卡尔曼过程噪声（较大，响应快）
-            kalman_r=0.3               # 卡尔曼测量噪声（较小，跟踪紧密）
+            # Step 1: 物理约束参数
+            min_distance=MIN_DISTANCE,
+            max_distance=MAX_DISTANCE,
+            max_velocity=MAX_VELOCITY,
+            # Step 2: 中位数滤波参数
+            median_window=MEDIAN_WINDOW_SIZE,
+            # Step 3: 卡尔曼滤波参数
+            kalman_q=0.15,              # 过程噪声（较小，更平滑）
+            kalman_r=0.4                # 测量噪声（中等，平衡响应和平滑）
         )
         
         # 原始数据路径
@@ -681,9 +1086,13 @@ class FilteredPathVisualizer:
                 'z': raw_z
             }
             
-            # 滤波处理
+            # 滤波处理（三步滤波流程）
             filtered = self.data_filter.filter(
-                data['distance_cm'], raw_x, raw_y, raw_z, current_time
+                data['distance_cm'], 
+                data['azimuth_deg'],
+                data['elevation_deg'],
+                raw_x, raw_y, raw_z, 
+                current_time
             )
             
             if filtered:
@@ -760,19 +1169,25 @@ class FilteredPathVisualizer:
         
         self.info_box.set_text(info_text)
         
-        # 更新统计信息
+        # 更新统计信息（三步滤波流程）
         stats = self.data_filter.get_statistics()
         stats_text = (
-            f"━━━ 滤波统计 ━━━\n\n"
+            f"━━━ 三步滤波统计 ━━━\n\n"
             f"总数据点:  {stats['total_count']:>6d}\n"
             f"异常值:    {stats['outlier_count']:>6d}\n"
+            f"├ 范围异常: {stats['reject_range']:>5d}\n"
+            f"├ 速度异常: {stats['reject_velocity']:>5d}\n"
             f"有效数据:  {stats['valid_count']:>6d}\n"
             f"异常率:    {stats['outlier_rate']:>6s}\n\n"
-            f"━━━ 滤波参数 ━━━\n\n"
-            f"最大速度:   250 cm/s\n"
-            f"最大跳变:   60 cm\n"
-            f"卡尔曼Q:    0.5\n"
-            f"卡尔曼R:    0.3\n\n"
+            f"━━━ 三步滤波流程 ━━━\n\n"
+            f"Step1: 物理约束检查\n"
+            f"  ├ 距离: {MIN_DISTANCE}-{MAX_DISTANCE}cm\n"
+            f"  └ 速度: <{MAX_VELOCITY}cm/s\n\n"
+            f"Step2: 中位数滤波\n"
+            f"  └ 窗口: {MEDIAN_WINDOW_SIZE}\n\n"
+            f"Step3: 卡尔曼平滑\n"
+            f"  ├ Q: 0.15\n"
+            f"  └ R: 0.4\n\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"🔴 红色：原始数据\n"
             f"🔵 蓝色：滤波数据\n"
