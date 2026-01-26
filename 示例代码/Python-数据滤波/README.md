@@ -10,228 +10,135 @@
 
 这些异常值如果不处理，会导致机器狗出现突然的位置跳变，影响跟随效果。
 
-## 解决方案
+## 滤波流程
 
-本模块提供多种数据滤波和异常值去除方法：
+本模块提供完整的三步滤波流程：
 
-### 1. 卡尔曼滤波 (Kalman Filter)
+| 步骤 | 方法 | 说明 |
+|------|------|------|
+| Step 1 | 物理约束检查 | 范围限制 + 速度限制 |
+| Step 2 | 中位数滤波 | 消除尖峰异常值 |
+| Step 3 | EKF状态估计 | 位置平滑 + 速度估计 |
 
-**原理**：基于状态估计的最优滤波器，结合预测值和测量值，给出最优估计。
+## 使用方法
 
-**优点**：
-- 数学最优估计
-- 能处理动态变化
-- 对小幅噪声效果好
-
-**参数调节**：
-- `Q`（过程噪声）：越大越相信测量值
-- `R`（测量噪声）：越大越相信预测值
+### 基本用法
 
 ```python
-from uwb_data_filter import KalmanFilter1D
-
-kf = KalmanFilter1D(q=0.1, r=0.5)
-filtered_value = kf.update(raw_value)
-```
-
-### 2. 中位数滤波 (Median Filter)
-
-**原理**：取滑动窗口内数据的中位数作为输出。
-
-**优点**：
-- 对脉冲噪声（突变）非常有效
-- 不会被单个异常值拉偏
-
-**适用场景**：人员遮挡导致的突然跳变
-
-```python
-from uwb_data_filter import MedianFilter
-
-mf = MedianFilter(window_size=5)
-filtered_value = mf.update(raw_value)
-```
-
-### 3. 指数加权移动平均 (EWMA)
-
-**原理**：新值 = α × 测量值 + (1-α) × 上一个估计值
-
-**优点**：
-- 计算简单
-- 可调节响应速度
-
-```python
-from uwb_data_filter import EWMAFilter
-
-ewma = EWMAFilter(alpha=0.3)
-filtered_value = ewma.update(raw_value)
-```
-
-### 4. 异常值检测
-
-提供三种检测方法：
-
-#### 4.1 基于速度的检测
-```python
-# 如果位置变化速度超过200cm/s，判定为异常
-detector.is_outlier_by_velocity(x, y, z)
-```
-
-#### 4.2 基于距离跳变的检测
-```python
-# 如果距离突然变化超过50cm，判定为异常
-detector.is_outlier_by_distance_jump(distance)
-```
-
-#### 4.3 基于Z-Score的检测
-```python
-# 如果数据偏离历史均值超过3个标准差，判定为异常
-detector.is_outlier_by_zscore(x, y, z)
-```
-
-### 5. 综合滤波器 (推荐)
-
-结合异常值检测和卡尔曼滤波的完整解决方案：
-
-```python
-from uwb_data_filter import UWBDataFilter
-
-# 创建滤波器
-filter = UWBDataFilter(
-    max_velocity=200.0,      # 最大速度 200 cm/s
-    max_distance_jump=50.0,  # 最大距离跳变 50 cm
-    z_score_threshold=3.0,   # Z-Score阈值
-    kalman_q=0.1,            # 卡尔曼过程噪声
-    kalman_r=0.5,            # 卡尔曼测量噪声
-    use_median_prefilter=True,  # 使用中位数预滤波
-    median_window=3
-)
-
-# 滤波
-result = filter.filter(distance, x, y, z)
-if result:
-    print(f"滤波后: X={result['x']}, Y={result['y']}, Z={result['z']}")
-    if result['is_outlier']:
-        print("(此数据点被检测为异常，已使用插值)")
-```
-
-## 参数调节建议
-
-### 针对机器狗跟随场景
-
-| 参数 | 推荐值 | 说明 |
-|------|--------|------|
-| max_velocity | 150-250 cm/s | 人正常行走速度约120cm/s，跑步约300cm/s |
-| max_distance_jump | 30-60 cm | 根据数据更新频率调整 |
-| z_score_threshold | 2.5-3.5 | 越小越严格 |
-| kalman_q | 0.05-0.2 | 越大响应越快，但平滑效果弱 |
-| kalman_r | 0.3-1.0 | 越大平滑效果越强，但响应越慢 |
-| median_window | 3-7 | 窗口越大，去异常值能力越强，但延迟越大 |
-
-### 根据场景调整
-
-**场景1：跟随速度较慢的人**
-```python
-filter = UWBDataFilter(
-    max_velocity=150.0,
-    kalman_r=0.8  # 更平滑
-)
-```
-
-**场景2：跟随速度较快的人**
-```python
-filter = UWBDataFilter(
-    max_velocity=300.0,
-    kalman_q=0.2,  # 更快响应
-    kalman_r=0.3
-)
-```
-
-**场景3：环境干扰较多**
-```python
-filter = UWBDataFilter(
-    max_distance_jump=30.0,  # 更严格的跳变检测
-    z_score_threshold=2.5,   # 更严格的统计检测
-    use_median_prefilter=True,
-    median_window=5
-)
-```
-
-## 使用示例
-
-### 完整示例
-
-```python
-import math
 from uwb_data_filter import UWBDataFilter
 
 # 创建滤波器
 filter = UWBDataFilter()
 
-# 模拟接收数据
-while True:
-    # 获取原始UWB数据
-    raw_distance = get_distance_from_uwb()
-    raw_azimuth = get_azimuth_from_uwb()
-    raw_elevation = get_elevation_from_uwb()
-    
-    # 球坐标转三维坐标
-    azimuth_rad = math.radians(raw_azimuth)
-    elevation_rad = math.radians(raw_elevation)
-    horizontal = raw_distance * math.cos(elevation_rad)
-    
-    raw_x = horizontal * math.sin(azimuth_rad)
-    raw_y = horizontal * math.cos(azimuth_rad)
-    raw_z = raw_distance * math.sin(elevation_rad)
-    
-    # 滤波
-    result = filter.filter(raw_distance, raw_x, raw_y, raw_z)
-    
-    if result and not result['is_outlier']:
-        # 使用滤波后的数据控制机器狗
-        control_robot(result['x'], result['y'])
-    elif result and result['is_outlier']:
-        # 异常值被检测到，使用插值数据
-        print("检测到异常值，使用上一个有效位置")
-        control_robot(result['x'], result['y'])
+# 滤波处理
+result = filter.filter(
+    distance=100,      # 距离 (cm)
+    azimuth=30,        # 方位角 (度)
+    elevation=5,       # 仰角 (度)
+    x=50,              # X坐标 (cm)
+    y=86,              # Y坐标 (cm)
+    z=8                # Z坐标 (cm)
+)
+
+if result and not result['is_outlier']:
+    # 使用滤波后的数据
+    print(f"位置: ({result['x']:.1f}, {result['y']:.1f}, {result['z']:.1f})")
+    print(f"速度: ({result['vx']:.1f}, {result['vy']:.1f}, {result['vz']:.1f})")
 ```
 
-## 运行演示
+### 自定义参数
+
+```python
+from uwb_data_filter import UWBDataFilter
+
+filter = UWBDataFilter(
+    max_velocity=300.0,         # 最大速度 (cm/s)
+    median_window=5,            # 中位数窗口大小
+    ekf_process_noise=0.5,      # EKF过程噪声
+    ekf_measurement_noise=1.0   # EKF测量噪声
+)
+```
+
+### 获取统计信息
+
+```python
+stats = filter.get_statistics()
+print(f"总数据: {stats['total']}")
+print(f"异常值: {stats['outlier']}")
+print(f"有效数据: {stats['valid']}")
+print(f"异常率: {stats['outlier_rate']}")
+```
+
+## 模块说明
+
+### UWBDataFilter
+
+综合滤波器，整合了物理约束检查、中位数滤波和EKF。
+
+### ExtendedKalmanFilter
+
+扩展卡尔曼滤波器，用于目标跟踪。
+
+状态向量：`[x, y, z, vx, vy, vz]`
+- `x, y, z`：位置
+- `vx, vy, vz`：速度
+
+使用恒速运动模型。
+
+```python
+from uwb_data_filter import ExtendedKalmanFilter
+
+ekf = ExtendedKalmanFilter(process_noise=0.5, measurement_noise=1.0)
+result = ekf.update(x, y, z)
+# result = {'x', 'y', 'z', 'vx', 'vy', 'vz'}
+```
+
+### MedianFilter3D
+
+三维中位数滤波器，对尖峰异常值非常有效。
+
+```python
+from uwb_data_filter import MedianFilter3D
+
+mf = MedianFilter3D(window_size=5)
+filtered_x, filtered_y, filtered_z = mf.update(x, y, z)
+```
+
+### PhysicalConstraintChecker
+
+物理约束检查器，检查数据是否在合理范围内。
+
+```python
+from uwb_data_filter import PhysicalConstraintChecker
+
+checker = PhysicalConstraintChecker(max_velocity=300.0)
+is_valid = checker.check(x, y, z, distance, azimuth, elevation)
+```
+
+## 参数说明
+
+### 物理约束参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| MIN_DISTANCE | 5 cm | 最小有效距离 |
+| MAX_DISTANCE | 5000 cm | 最大有效距离 |
+| MAX_VELOCITY | 300 cm/s | 最大移动速度（人小跑速度） |
+
+### EKF参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| process_noise | 0.5 | 过程噪声（越大响应越快） |
+| measurement_noise | 1.0 | 测量噪声（越大越平滑） |
+
+## 依赖安装
 
 ```bash
-python uwb_data_filter.py
+pip install numpy
 ```
 
-输出示例：
-```
-============================================================
-    UWB数据滤波器演示
-============================================================
+## 参考资料
 
-模拟数据测试（带异常值）：
-------------------------------------------------------------
-序号 |  原始距离 |    原始X |    原始Y |    滤波X |    滤波Y |   状态
-------------------------------------------------------------
-   1 |    141.4 |    100.0 |    100.0 |    100.0 |    100.0 |   正常
-   2 |    142.1 |    101.5 |    100.2 |    100.5 |    100.1 |   正常
-  ...
-  11 |    500.2 |    302.5 |    250.2 |      -- |      -- |   丢弃
-  12 |    143.8 |    102.3 |    101.5 |    101.2 |    100.6 |   正常
-  ...
-
-滤波统计：
-  总数据点: 30
-  异常值数: 2
-  有效数据: 28
-  异常率:   6.7%
-```
-
-## 常见问题
-
-### Q: 滤波后数据有延迟怎么办？
-A: 减小中位数窗口大小，或增大卡尔曼滤波的Q值。
-
-### Q: 异常值检测太严格/太宽松？
-A: 调整 `max_velocity`, `max_distance_jump`, `z_score_threshold` 参数。
-
-### Q: 数据仍然不够平滑？
-A: 增大卡尔曼滤波的R值，或启用中位数预滤波。
+- 《Probabilistic Robotics》 (Thrun, Burgard, Fox)
+- scipy.signal
