@@ -10,21 +10,38 @@ UWB单基站跟随套件 - 数据滤波与异常值去除模块
     适用于机器狗跟随场景中因人员经过等原因导致的异常测量值。
 
 主要方法：
-    1. 卡尔曼滤波 (Kalman Filter)
-    2. 滑动窗口中位数滤波 (Median Filter)
-    3. 滑动窗口均值滤波 (Moving Average)
-    4. 指数加权移动平均 (EWMA)
-    5. 基于速度/加速度的异常值检测
-    6. 基于统计的异常值检测 (Z-Score / IQR)
+    1. 卡尔曼滤波 (Kalman Filter) - 单点测量平滑
+    2. 扩展卡尔曼滤波 (EKF) - 位置+速度状态估计（新增）
+    3. 滑动窗口中位数滤波 (Median Filter)
+    4. 滑动窗口均值滤波 (Moving Average)
+    5. 指数加权移动平均 (EWMA)
+    6. 基于速度/加速度的异常值检测
+    7. 基于统计的异常值检测 (Z-Score / IQR)
+
+EKF扩展卡尔曼滤波说明：
+    为什么传感器已有KF还能用EKF？
+    - 传感器KF：测量级滤波，仅平滑单个测量值
+    - EKF：状态估计滤波，结合运动模型预测位置和速度
+    
+    EKF优势：
+    - 预测目标运动趋势
+    - 估计移动速度（用于机器狗控制）
+    - 数据丢失时可预测位置
 
 使用方法：
-    from uwb_data_filter import UWBDataFilter
+    from uwb_data_filter import UWBDataFilter, ExtendedKalmanFilter
     
+    # 使用综合滤波器
     filter = UWBDataFilter()
-    filtered_data = filter.filter(raw_data)
+    filtered_data = filter.filter(distance, x, y, z)
+    
+    # 使用EKF
+    ekf = ExtendedKalmanFilter()
+    result = ekf.update(x, y, z, current_time)
+    # result包含: x, y, z (位置), vx, vy, vz (速度)
     
 作者：Copilot
-日期：2026-01-22
+日期：2026-01-26
 ============================================================================
 """
 
@@ -146,6 +163,223 @@ class KalmanFilter3D:
         self.filter_x.reset()
         self.filter_y.reset()
         self.filter_z.reset()
+
+
+# ============================================================================
+# 扩展卡尔曼滤波器 (EKF) - 用于目标跟踪的状态估计
+# ============================================================================
+
+class ExtendedKalmanFilter:
+    """
+    扩展卡尔曼滤波器 (EKF) - 用于机器狗跟随场景的目标跟踪
+    
+    为什么传感器已有KF还能用EKF？
+    ================================
+    - 传感器自带的KF：是**测量级滤波**，仅平滑单个测量值
+    - EKF：是**状态估计滤波**，结合**运动模型**预测目标的位置和速度
+    
+    EKF的优势：
+    1. 预测目标的运动趋势（即使短暂丢失数据也能预测位置）
+    2. 融合速度状态，实现更精确的跟踪
+    3. 对突变数据具有更强的抑制能力
+    4. 能够输出目标速度信息，用于机器狗控制
+    
+    状态向量（6维）：
+        x = [x, y, z, vx, vy, vz]^T
+        其中 (x,y,z) 是位置，(vx,vy,vz) 是速度
+    
+    运动模型：恒速模型 (Constant Velocity Model)
+        x_k = x_{k-1} + vx * dt
+        vx_k = vx_{k-1}  （假设速度缓慢变化）
+    
+    参考：《Probabilistic Robotics》 (Thrun, Burgard, Fox)
+    """
+    
+    def __init__(self, 
+                 process_noise_pos: float = 0.5,     # 位置过程噪声
+                 process_noise_vel: float = 2.0,     # 速度过程噪声
+                 measurement_noise: float = 5.0):    # 测量噪声
+        """
+        初始化EKF
+        
+        参数：
+            process_noise_pos: 位置过程噪声（Q矩阵对角元素）
+            process_noise_vel: 速度过程噪声
+            measurement_noise: 测量噪声（R矩阵对角元素）
+        """
+        self.n_states = 6
+        self.n_measurements = 3
+        
+        self.x = None
+        self.P = None
+        
+        self.Q = self._create_diagonal_matrix(
+            [process_noise_pos, process_noise_pos, process_noise_pos,
+             process_noise_vel, process_noise_vel, process_noise_vel]
+        )
+        
+        self.R = self._create_diagonal_matrix(
+            [measurement_noise, measurement_noise, measurement_noise]
+        )
+        
+        self.H = [
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0]
+        ]
+        
+        self.last_time = None
+        self.initialized = False
+    
+    def _create_diagonal_matrix(self, diagonal_values):
+        n = len(diagonal_values)
+        matrix = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            matrix[i][i] = diagonal_values[i]
+        return matrix
+    
+    def _matrix_multiply(self, A, B):
+        rows_A, cols_A = len(A), len(A[0])
+        rows_B, cols_B = len(B), len(B[0])
+        result = [[0.0] * cols_B for _ in range(rows_A)]
+        for i in range(rows_A):
+            for j in range(cols_B):
+                for k in range(cols_A):
+                    result[i][j] += A[i][k] * B[k][j]
+        return result
+    
+    def _matrix_add(self, A, B):
+        return [[A[i][j] + B[i][j] for j in range(len(A[0]))] for i in range(len(A))]
+    
+    def _matrix_subtract(self, A, B):
+        return [[A[i][j] - B[i][j] for j in range(len(A[0]))] for i in range(len(A))]
+    
+    def _matrix_transpose(self, A):
+        return [[A[j][i] for j in range(len(A))] for i in range(len(A[0]))]
+    
+    def _matrix_inverse_3x3(self, A):
+        det = (A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
+               A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+               A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]))
+        
+        if abs(det) < 1e-10:
+            for i in range(3):
+                A[i][i] += 1e-6
+            det = (A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
+                   A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+                   A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]))
+        
+        inv_det = 1.0 / det
+        inv = [[0.0] * 3 for _ in range(3)]
+        inv[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * inv_det
+        inv[0][1] = (A[0][2] * A[2][1] - A[0][1] * A[2][2]) * inv_det
+        inv[0][2] = (A[0][1] * A[1][2] - A[0][2] * A[1][1]) * inv_det
+        inv[1][0] = (A[1][2] * A[2][0] - A[1][0] * A[2][2]) * inv_det
+        inv[1][1] = (A[0][0] * A[2][2] - A[0][2] * A[2][0]) * inv_det
+        inv[1][2] = (A[0][2] * A[1][0] - A[0][0] * A[1][2]) * inv_det
+        inv[2][0] = (A[1][0] * A[2][1] - A[1][1] * A[2][0]) * inv_det
+        inv[2][1] = (A[0][1] * A[2][0] - A[0][0] * A[2][1]) * inv_det
+        inv[2][2] = (A[0][0] * A[1][1] - A[0][1] * A[1][0]) * inv_det
+        return inv
+    
+    def _create_state_transition_matrix(self, dt):
+        F = [[0.0] * 6 for _ in range(6)]
+        for i in range(6):
+            F[i][i] = 1.0
+        F[0][3] = dt
+        F[1][4] = dt
+        F[2][5] = dt
+        return F
+    
+    def predict(self, dt: float):
+        if not self.initialized:
+            return
+        
+        F = self._create_state_transition_matrix(dt)
+        x_pred = [[0.0] for _ in range(6)]
+        for i in range(6):
+            for j in range(6):
+                x_pred[i][0] += F[i][j] * self.x[j][0]
+        self.x = x_pred
+        
+        FP = self._matrix_multiply(F, self.P)
+        F_T = self._matrix_transpose(F)
+        FP_FT = self._matrix_multiply(FP, F_T)
+        self.P = self._matrix_add(FP_FT, self.Q)
+    
+    def update(self, z_x: float, z_y: float, z_z: float, current_time: float = None) -> Dict:
+        """
+        更新EKF状态
+        
+        参数：
+            z_x, z_y, z_z: 测量的位置坐标
+            current_time: 当前时间戳
+            
+        返回：
+            dict: 滤波后的位置和速度
+        """
+        if current_time is None:
+            current_time = time.time()
+        
+        if not self.initialized:
+            self.x = [[z_x], [z_y], [z_z], [0.0], [0.0], [0.0]]
+            self.P = self._create_diagonal_matrix([10, 10, 10, 100, 100, 100])
+            self.last_time = current_time
+            self.initialized = True
+            return {'x': z_x, 'y': z_y, 'z': z_z, 'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
+        
+        dt = current_time - self.last_time
+        if dt <= 0:
+            dt = 0.01
+        self.last_time = current_time
+        
+        self.predict(dt)
+        
+        z = [[z_x], [z_y], [z_z]]
+        H_T = self._matrix_transpose(self.H)
+        PH_T = self._matrix_multiply(self.P, H_T)
+        HPH_T = self._matrix_multiply(self.H, PH_T)
+        S = self._matrix_add(HPH_T, self.R)
+        S_inv = self._matrix_inverse_3x3(S)
+        K = self._matrix_multiply(PH_T, S_inv)
+        
+        Hx = [[0.0] for _ in range(3)]
+        for i in range(3):
+            for j in range(6):
+                Hx[i][0] += self.H[i][j] * self.x[j][0]
+        y = self._matrix_subtract(z, Hx)
+        
+        Ky = [[0.0] for _ in range(6)]
+        for i in range(6):
+            for j in range(3):
+                Ky[i][0] += K[i][j] * y[j][0]
+        self.x = self._matrix_add(self.x, Ky)
+        
+        KH = self._matrix_multiply(K, self.H)
+        I = self._create_diagonal_matrix([1, 1, 1, 1, 1, 1])
+        I_KH = self._matrix_subtract(I, KH)
+        self.P = self._matrix_multiply(I_KH, self.P)
+        
+        return {
+            'x': self.x[0][0], 'y': self.x[1][0], 'z': self.x[2][0],
+            'vx': self.x[3][0], 'vy': self.x[4][0], 'vz': self.x[5][0]
+        }
+    
+    def get_predicted_position(self, dt_ahead: float = 0.1) -> Optional[Dict]:
+        """获取未来位置预测"""
+        if not self.initialized:
+            return None
+        pred_x = self.x[0][0] + self.x[3][0] * dt_ahead
+        pred_y = self.x[1][0] + self.x[4][0] * dt_ahead
+        pred_z = self.x[2][0] + self.x[5][0] * dt_ahead
+        return {'x': pred_x, 'y': pred_y, 'z': pred_z}
+    
+    def reset(self):
+        """重置滤波器"""
+        self.x = None
+        self.P = None
+        self.last_time = None
+        self.initialized = False
 
 
 # ============================================================================
