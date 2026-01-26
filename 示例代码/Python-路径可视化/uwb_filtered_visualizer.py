@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================================
-UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序（改进版）
+UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序（支持EKF）
 ============================================================================
 
 功能说明：
@@ -11,15 +11,22 @@ UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序（�
     - 上排：原始数据的俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
     - 下排：滤波后数据的俯视图(X-Y)、前视图(X-Z)、侧视图(Y-Z)
 
-改进版滤波算法（两步滤波流程）：
+滤波算法（两种模式）：
+
+【标准模式】两步滤波流程：
     Step 1 (物理约束检查): 检测数据是否在物理可能的范围内
-        - 绝对范围限制（距离、角度）
-        - 速度限制（位置变化不能超过物理可能的速度）
     Step 2 (中位数滤波): 使用窗口为5的中位数滤波消除尖峰异常
-        - 对距离、方位角、仰角、X、Y、Z分别进行中位数滤波
-        - 方位角使用角度归一化处理0°/360°边界
+    注意：传感器数据已自带卡尔曼滤波，因此默认不再额外添加
+
+【EKF模式】三步滤波流程（使用 --ekf 参数启用）：
+    Step 1 (物理约束检查): 检测数据是否在物理可能的范围内
+    Step 2 (中位数滤波): 使用窗口为5的中位数滤波消除尖峰异常
+    Step 3 (EKF状态估计): 扩展卡尔曼滤波（位置+速度状态估计）
     
-    注意：传感器数据已自带卡尔曼滤波，因此本程序不再额外添加卡尔曼滤波
+    为什么传感器已有KF还能用EKF？
+    - 传感器KF：测量级滤波，仅平滑单个测量值
+    - EKF：状态估计滤波，结合运动模型预测位置和速度
+    - EKF优势：预测目标位置、估计移动速度、数据丢失时可预测
 
 硬件连接：
     - UWB基站通过USB转TTL模块连接到电脑
@@ -29,18 +36,17 @@ UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序（�
     pip install pyserial matplotlib numpy
 
 使用方法：
-    python uwb_filtered_visualizer.py [串口号]
-    例如：python uwb_filtered_visualizer.py COM3
-    
-    模拟模式（含异常值）：
-    python uwb_filtered_visualizer.py --simulate
+    python uwb_filtered_visualizer.py [串口号]           # 标准模式
+    python uwb_filtered_visualizer.py COM3 --ekf        # EKF模式
+    python uwb_filtered_visualizer.py --simulate        # 模拟模式
+    python uwb_filtered_visualizer.py --simulate --ekf  # 模拟模式+EKF
     
 参考资料：
     - "Probabilistic Robotics" (Thrun, Burgard, Fox)
     - scipy.signal (medfilt, lfilter)
     
 作者：Copilot
-日期：2026-01-22
+日期：2026-01-26
 ============================================================================
 """
 
@@ -446,22 +452,323 @@ class PhysicalConstraintFilter:
 
 
 # ============================================================================
-# 综合数据滤波器（两步滤波流程）
+# 扩展卡尔曼滤波器 (EKF) - 用于目标跟踪的状态估计
+# ============================================================================
+
+class ExtendedKalmanFilter:
+    """
+    扩展卡尔曼滤波器 (EKF) - 用于机器狗跟随场景的目标跟踪
+    
+    为什么传感器已有KF还能用EKF？
+    ================================
+    - 传感器自带的KF：是**测量级滤波**，仅平滑单个测量值
+    - EKF：是**状态估计滤波**，结合**运动模型**预测目标的位置和速度
+    
+    EKF的优势：
+    1. 预测目标的运动趋势（即使短暂丢失数据也能预测位置）
+    2. 融合速度状态，实现更精确的跟踪
+    3. 对突变数据具有更强的抑制能力
+    4. 能够输出目标速度信息，用于机器狗控制
+    
+    状态向量（6维）：
+        x = [x, y, z, vx, vy, vz]^T
+        其中 (x,y,z) 是位置，(vx,vy,vz) 是速度
+    
+    运动模型：恒速模型 (Constant Velocity Model)
+        x_k = x_{k-1} + vx * dt
+        vx_k = vx_{k-1}  （假设速度缓慢变化）
+    
+    参考：《Probabilistic Robotics》 (Thrun, Burgard, Fox)
+    """
+    
+    def __init__(self, 
+                 process_noise_pos: float = 0.5,     # 位置过程噪声
+                 process_noise_vel: float = 2.0,     # 速度过程噪声
+                 measurement_noise: float = 5.0):    # 测量噪声
+        """
+        初始化EKF
+        
+        Args:
+            process_noise_pos: 位置过程噪声（Q矩阵对角元素）
+                - 越大：更相信测量，响应更快
+                - 越小：更相信预测，更平滑
+            process_noise_vel: 速度过程噪声
+            measurement_noise: 测量噪声（R矩阵对角元素）
+        """
+        # 状态维度
+        self.n_states = 6      # [x, y, z, vx, vy, vz]
+        self.n_measurements = 3  # [x, y, z]
+        
+        # 状态向量 x = [x, y, z, vx, vy, vz]^T
+        self.x = None  # 延迟初始化
+        
+        # 状态协方差矩阵 P (6x6)
+        self.P = None
+        
+        # 过程噪声协方差 Q (6x6)
+        self.Q = self._create_diagonal_matrix(
+            [process_noise_pos, process_noise_pos, process_noise_pos,
+             process_noise_vel, process_noise_vel, process_noise_vel]
+        )
+        
+        # 测量噪声协方差 R (3x3)
+        self.R = self._create_diagonal_matrix(
+            [measurement_noise, measurement_noise, measurement_noise]
+        )
+        
+        # 观测矩阵 H (3x6) - 我们只能观测位置，不能直接观测速度
+        # z = H * x = [x, y, z]
+        self.H = [
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0]
+        ]
+        
+        # 上一次更新时间
+        self.last_time = None
+        self.initialized = False
+    
+    def _create_diagonal_matrix(self, diagonal_values):
+        """创建对角矩阵"""
+        n = len(diagonal_values)
+        matrix = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            matrix[i][i] = diagonal_values[i]
+        return matrix
+    
+    def _matrix_multiply(self, A, B):
+        """矩阵乘法 A * B"""
+        rows_A, cols_A = len(A), len(A[0])
+        rows_B, cols_B = len(B), len(B[0])
+        
+        if cols_A != rows_B:
+            raise ValueError("矩阵维度不匹配")
+        
+        result = [[0.0] * cols_B for _ in range(rows_A)]
+        for i in range(rows_A):
+            for j in range(cols_B):
+                for k in range(cols_A):
+                    result[i][j] += A[i][k] * B[k][j]
+        return result
+    
+    def _matrix_add(self, A, B):
+        """矩阵加法 A + B"""
+        return [[A[i][j] + B[i][j] for j in range(len(A[0]))] for i in range(len(A))]
+    
+    def _matrix_subtract(self, A, B):
+        """矩阵减法 A - B"""
+        return [[A[i][j] - B[i][j] for j in range(len(A[0]))] for i in range(len(A))]
+    
+    def _matrix_transpose(self, A):
+        """矩阵转置"""
+        return [[A[j][i] for j in range(len(A))] for i in range(len(A[0]))]
+    
+    def _matrix_inverse_3x3(self, A):
+        """3x3矩阵求逆（用于卡尔曼增益计算）"""
+        # 计算行列式
+        det = (A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
+               A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+               A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]))
+        
+        if abs(det) < 1e-10:
+            # 如果矩阵接近奇异，添加正则化
+            for i in range(3):
+                A[i][i] += 1e-6
+            det = (A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) -
+                   A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
+                   A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]))
+        
+        inv_det = 1.0 / det
+        
+        # 计算伴随矩阵并除以行列式
+        inv = [[0.0] * 3 for _ in range(3)]
+        inv[0][0] = (A[1][1] * A[2][2] - A[1][2] * A[2][1]) * inv_det
+        inv[0][1] = (A[0][2] * A[2][1] - A[0][1] * A[2][2]) * inv_det
+        inv[0][2] = (A[0][1] * A[1][2] - A[0][2] * A[1][1]) * inv_det
+        inv[1][0] = (A[1][2] * A[2][0] - A[1][0] * A[2][2]) * inv_det
+        inv[1][1] = (A[0][0] * A[2][2] - A[0][2] * A[2][0]) * inv_det
+        inv[1][2] = (A[0][2] * A[1][0] - A[0][0] * A[1][2]) * inv_det
+        inv[2][0] = (A[1][0] * A[2][1] - A[1][1] * A[2][0]) * inv_det
+        inv[2][1] = (A[0][1] * A[2][0] - A[0][0] * A[2][1]) * inv_det
+        inv[2][2] = (A[0][0] * A[1][1] - A[0][1] * A[1][0]) * inv_det
+        
+        return inv
+    
+    def _create_state_transition_matrix(self, dt):
+        """
+        创建状态转移矩阵 F（恒速模型）
+        
+        F = | I   dt*I |
+            | 0    I   |
+        
+        其中 I 是 3x3 单位矩阵
+        """
+        F = [[0.0] * 6 for _ in range(6)]
+        
+        # 对角线为1
+        for i in range(6):
+            F[i][i] = 1.0
+        
+        # 位置受速度影响：x_new = x_old + vx * dt
+        F[0][3] = dt  # x 受 vx 影响
+        F[1][4] = dt  # y 受 vy 影响
+        F[2][5] = dt  # z 受 vz 影响
+        
+        return F
+    
+    def predict(self, dt: float):
+        """
+        预测步骤：基于运动模型预测下一状态
+        
+        Args:
+            dt: 时间间隔（秒）
+        """
+        if not self.initialized:
+            return
+        
+        # 状态转移矩阵
+        F = self._create_state_transition_matrix(dt)
+        
+        # 预测状态: x_pred = F * x
+        x_pred = [[0.0] for _ in range(6)]
+        for i in range(6):
+            for j in range(6):
+                x_pred[i][0] += F[i][j] * self.x[j][0]
+        self.x = x_pred
+        
+        # 预测协方差: P_pred = F * P * F^T + Q
+        FP = self._matrix_multiply(F, self.P)
+        F_T = self._matrix_transpose(F)
+        FP_FT = self._matrix_multiply(FP, F_T)
+        self.P = self._matrix_add(FP_FT, self.Q)
+    
+    def update(self, z_x: float, z_y: float, z_z: float, current_time: float = None):
+        """
+        更新步骤：用测量值修正预测
+        
+        Args:
+            z_x, z_y, z_z: 测量的位置坐标
+            current_time: 当前时间戳
+            
+        Returns:
+            dict: 滤波后的位置和速度
+        """
+        if current_time is None:
+            current_time = time.time()
+        
+        # 第一次测量，初始化状态
+        if not self.initialized:
+            self.x = [[z_x], [z_y], [z_z], [0.0], [0.0], [0.0]]  # 初始速度为0
+            self.P = self._create_diagonal_matrix([10, 10, 10, 100, 100, 100])  # 初始不确定性
+            self.last_time = current_time
+            self.initialized = True
+            return {
+                'x': z_x, 'y': z_y, 'z': z_z,
+                'vx': 0.0, 'vy': 0.0, 'vz': 0.0
+            }
+        
+        # 计算时间间隔
+        dt = current_time - self.last_time
+        if dt <= 0:
+            dt = 0.01
+        self.last_time = current_time
+        
+        # 1. 预测步骤
+        self.predict(dt)
+        
+        # 2. 更新步骤
+        # 测量向量 z (3x1)
+        z = [[z_x], [z_y], [z_z]]
+        
+        # 计算卡尔曼增益 K = P * H^T * (H * P * H^T + R)^(-1)
+        H_T = self._matrix_transpose(self.H)
+        PH_T = self._matrix_multiply(self.P, H_T)
+        HPH_T = self._matrix_multiply(self.H, PH_T)
+        S = self._matrix_add(HPH_T, self.R)  # 创新协方差
+        S_inv = self._matrix_inverse_3x3(S)
+        K = self._matrix_multiply(PH_T, S_inv)  # 卡尔曼增益 (6x3)
+        
+        # 计算创新（测量残差）: y = z - H * x
+        Hx = [[0.0] for _ in range(3)]
+        for i in range(3):
+            for j in range(6):
+                Hx[i][0] += self.H[i][j] * self.x[j][0]
+        y = self._matrix_subtract(z, Hx)
+        
+        # 更新状态: x = x + K * y
+        Ky = [[0.0] for _ in range(6)]
+        for i in range(6):
+            for j in range(3):
+                Ky[i][0] += K[i][j] * y[j][0]
+        self.x = self._matrix_add(self.x, Ky)
+        
+        # 更新协方差: P = (I - K * H) * P
+        KH = self._matrix_multiply(K, self.H)
+        I = self._create_diagonal_matrix([1, 1, 1, 1, 1, 1])
+        I_KH = self._matrix_subtract(I, KH)
+        self.P = self._matrix_multiply(I_KH, self.P)
+        
+        return {
+            'x': self.x[0][0],
+            'y': self.x[1][0],
+            'z': self.x[2][0],
+            'vx': self.x[3][0],
+            'vy': self.x[4][0],
+            'vz': self.x[5][0]
+        }
+    
+    def get_predicted_position(self, dt_ahead: float = 0.1):
+        """
+        获取未来位置预测（用于机器狗提前规划）
+        
+        Args:
+            dt_ahead: 预测多少秒后的位置
+            
+        Returns:
+            dict: 预测的位置
+        """
+        if not self.initialized:
+            return None
+        
+        # 使用当前速度预测未来位置
+        pred_x = self.x[0][0] + self.x[3][0] * dt_ahead
+        pred_y = self.x[1][0] + self.x[4][0] * dt_ahead
+        pred_z = self.x[2][0] + self.x[5][0] * dt_ahead
+        
+        return {'x': pred_x, 'y': pred_y, 'z': pred_z}
+    
+    def reset(self):
+        """重置滤波器"""
+        self.x = None
+        self.P = None
+        self.last_time = None
+        self.initialized = False
+
+
+# ============================================================================
+# 综合数据滤波器（三步滤波流程：物理约束 + 中位数 + EKF）
 # ============================================================================
 
 class UWBDataFilter:
     """
     UWB数据综合滤波器 - 实现机器狗传感器数据滤波的完整流程
     
-    两步滤波流程：
-        Step 1 (物理约束检查): 应用物理约束滤波
-            - 如果传感器说头部朝向后方（但物理上不可能），丢弃该帧
-            - 使用上一个有效值
-        
-        Step 2 (去尖峰): 将有效数据通过中位数滤波器（窗口大小3或5）
-            - 这能消除随机的"毛刺"
+    滤波流程（支持两种模式）：
     
-    注意：传感器数据已自带卡尔曼滤波，因此本程序不再额外添加卡尔曼滤波
+    【模式1】两步滤波（use_ekf=False，默认）：
+        Step 1 (物理约束检查): 应用物理约束滤波
+        Step 2 (去尖峰): 中位数滤波器（窗口大小3或5）
+        注意：传感器数据已自带卡尔曼滤波，因此默认不再额外添加
+    
+    【模式2】三步滤波（use_ekf=True）：
+        Step 1 (物理约束检查): 应用物理约束滤波
+        Step 2 (去尖峰): 中位数滤波器
+        Step 3 (状态估计): EKF扩展卡尔曼滤波（位置+速度状态估计）
+        
+        为什么传感器已有KF还能用EKF？
+        - 传感器KF：测量级滤波，仅平滑单个测量值
+        - EKF：状态估计滤波，结合运动模型预测位置和速度
+        - EKF可以在数据丢失时预测位置，并输出速度信息用于机器狗控制
     
     参考：《Probabilistic Robotics》 (Thrun, Burgard, Fox)
     """
@@ -472,7 +779,12 @@ class UWBDataFilter:
                  max_distance: float = MAX_DISTANCE,
                  max_velocity: float = MAX_VELOCITY,
                  # 中位数滤波参数
-                 median_window: int = MEDIAN_WINDOW_SIZE):
+                 median_window: int = MEDIAN_WINDOW_SIZE,
+                 # EKF参数
+                 use_ekf: bool = False,
+                 ekf_process_noise_pos: float = 0.5,
+                 ekf_process_noise_vel: float = 2.0,
+                 ekf_measurement_noise: float = 5.0):
         """
         初始化综合滤波器
         
@@ -481,6 +793,10 @@ class UWBDataFilter:
             max_distance: 最大有效距离
             max_velocity: 最大允许速度
             median_window: 中位数滤波窗口大小
+            use_ekf: 是否启用EKF扩展卡尔曼滤波
+            ekf_process_noise_pos: EKF位置过程噪声
+            ekf_process_noise_vel: EKF速度过程噪声
+            ekf_measurement_noise: EKF测量噪声
         """
         # ===== Step 1: 物理约束滤波器 =====
         self.physical_filter = PhysicalConstraintFilter(
@@ -497,7 +813,16 @@ class UWBDataFilter:
         self.median_y = MedianFilter(median_window)
         self.median_z = MedianFilter(median_window)
         
-        # 注意：传感器数据已自带卡尔曼滤波，不再额外添加
+        # ===== Step 3: EKF扩展卡尔曼滤波器（可选） =====
+        self.use_ekf = use_ekf
+        if use_ekf:
+            self.ekf = ExtendedKalmanFilter(
+                process_noise_pos=ekf_process_noise_pos,
+                process_noise_vel=ekf_process_noise_vel,
+                measurement_noise=ekf_measurement_noise
+            )
+        else:
+            self.ekf = None
         
         # 统计信息
         self.total_count = 0
@@ -507,12 +832,15 @@ class UWBDataFilter:
         
         # 最后有效数据
         self.last_valid_data = None
+        
+        # 最后的速度信息（仅EKF模式可用）
+        self.last_velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
     
     def filter(self, distance: float, azimuth: float, elevation: float,
                x: float, y: float, z: float,
                current_time: float = None) -> dict:
         """
-        执行两步滤波流程
+        执行滤波流程（两步或三步，取决于是否启用EKF）
         
         Args:
             distance: 原始距离（厘米）
@@ -522,7 +850,11 @@ class UWBDataFilter:
             current_time: 时间戳
             
         Returns:
-            滤波后的数据字典，包含 'is_outlier' 标志
+            滤波后的数据字典，包含:
+            - 位置: x, y, z
+            - 球坐标: distance, azimuth, elevation
+            - 速度（仅EKF模式）: vx, vy, vz
+            - 标志: is_outlier, reject_reason
         """
         if current_time is None:
             current_time = time.time()
@@ -555,32 +887,84 @@ class UWBDataFilter:
         median_y = self.median_y.filter(y)
         median_z = self.median_z.filter(z)
         
-        # 构建结果（传感器数据已自带卡尔曼滤波，直接使用中位数滤波结果）
-        result = {
-            'distance': round(median_distance, 2),
-            'azimuth': round(median_azimuth, 2),
-            'elevation': round(median_elevation, 2),
-            'x': round(median_x, 2),
-            'y': round(median_y, 2),
-            'z': round(median_z, 2),
-            'is_outlier': False,
-            'reject_reason': None
-        }
+        # ========== Step 3: EKF扩展卡尔曼滤波（可选） ==========
+        if self.use_ekf and self.ekf:
+            ekf_result = self.ekf.update(median_x, median_y, median_z, current_time)
+            
+            # 使用EKF输出
+            result = {
+                'distance': round(median_distance, 2),
+                'azimuth': round(median_azimuth, 2),
+                'elevation': round(median_elevation, 2),
+                'x': round(ekf_result['x'], 2),
+                'y': round(ekf_result['y'], 2),
+                'z': round(ekf_result['z'], 2),
+                'vx': round(ekf_result['vx'], 2),
+                'vy': round(ekf_result['vy'], 2),
+                'vz': round(ekf_result['vz'], 2),
+                'is_outlier': False,
+                'reject_reason': None
+            }
+            self.last_velocity = {
+                'vx': ekf_result['vx'],
+                'vy': ekf_result['vy'],
+                'vz': ekf_result['vz']
+            }
+        else:
+            # 不使用EKF，直接返回中位数滤波结果
+            result = {
+                'distance': round(median_distance, 2),
+                'azimuth': round(median_azimuth, 2),
+                'elevation': round(median_elevation, 2),
+                'x': round(median_x, 2),
+                'y': round(median_y, 2),
+                'z': round(median_z, 2),
+                'vx': 0.0,
+                'vy': 0.0,
+                'vz': 0.0,
+                'is_outlier': False,
+                'reject_reason': None
+            }
         
         self.last_valid_data = result.copy()
         return result
     
+    def get_predicted_position(self, dt_ahead: float = 0.1):
+        """
+        获取未来位置预测（仅EKF模式可用）
+        
+        Args:
+            dt_ahead: 预测多少秒后的位置
+            
+        Returns:
+            dict: 预测的位置，如果EKF未启用则返回None
+        """
+        if self.use_ekf and self.ekf:
+            return self.ekf.get_predicted_position(dt_ahead)
+        return None
+    
+    def get_velocity(self):
+        """
+        获取当前速度估计（仅EKF模式有意义的值）
+        
+        Returns:
+            dict: {'vx': float, 'vy': float, 'vz': float}
+        """
+        return self.last_velocity
+    
     def get_statistics(self) -> dict:
         """获取滤波统计信息"""
         outlier_rate = self.outlier_count / self.total_count if self.total_count > 0 else 0
-        return {
+        stats = {
             'total_count': self.total_count,
             'outlier_count': self.outlier_count,
             'valid_count': self.total_count - self.outlier_count,
             'outlier_rate': f"{outlier_rate * 100:.1f}%",
             'reject_range': self.reject_count_range,
-            'reject_velocity': self.reject_count_velocity
+            'reject_velocity': self.reject_count_velocity,
+            'use_ekf': self.use_ekf
         }
+        return stats
     
     def reset(self):
         """重置所有滤波器状态"""
@@ -591,11 +975,14 @@ class UWBDataFilter:
         self.median_x.reset()
         self.median_y.reset()
         self.median_z.reset()
+        if self.use_ekf and self.ekf:
+            self.ekf.reset()
         self.total_count = 0
         self.outlier_count = 0
         self.reject_count_range = 0
         self.reject_count_velocity = 0
         self.last_valid_data = None
+        self.last_velocity = {'vx': 0.0, 'vy': 0.0, 'vz': 0.0}
 
 
 # ============================================================================
@@ -844,12 +1231,20 @@ class SimulatedReceiver:
 # ============================================================================
 
 class FilteredPathVisualizer:
-    """原始数据与滤波数据对比可视化器（改进版三步滤波）"""
+    """原始数据与滤波数据对比可视化器（支持EKF扩展卡尔曼滤波）"""
     
-    def __init__(self, receiver):
-        self.receiver = receiver
+    def __init__(self, receiver, use_ekf=False):
+        """
+        初始化可视化器
         
-        # 改进版滤波器（三步滤波流程）
+        Args:
+            receiver: 数据接收器（串口或模拟）
+            use_ekf: 是否启用EKF扩展卡尔曼滤波
+        """
+        self.receiver = receiver
+        self.use_ekf = use_ekf
+        
+        # 滤波器（支持两步或三步滤波流程）
         self.data_filter = UWBDataFilter(
             # Step 1: 物理约束参数
             min_distance=MIN_DISTANCE,
@@ -857,9 +1252,11 @@ class FilteredPathVisualizer:
             max_velocity=MAX_VELOCITY,
             # Step 2: 中位数滤波参数
             median_window=MEDIAN_WINDOW_SIZE,
-            # Step 3: 卡尔曼滤波参数
-            kalman_q=0.15,              # 过程噪声（较小，更平滑）
-            kalman_r=0.4                # 测量噪声（中等，平衡响应和平滑）
+            # Step 3: EKF参数（可选）
+            use_ekf=use_ekf,
+            ekf_process_noise_pos=0.5,
+            ekf_process_noise_vel=2.0,
+            ekf_measurement_noise=5.0
         )
         
         # 原始数据路径
@@ -874,7 +1271,7 @@ class FilteredPathVisualizer:
         self.data_count = 0
         self.outlier_count = 0
         self.last_raw_data = {'distance': 0, 'azimuth': 0, 'elevation': 0, 'x': 0, 'y': 0, 'z': 0}
-        self.last_filtered_data = {'distance': 0, 'x': 0, 'y': 0, 'z': 0}
+        self.last_filtered_data = {'distance': 0, 'x': 0, 'y': 0, 'z': 0, 'vx': 0, 'vy': 0, 'vz': 0}
         
         self.setup_plot()
     
@@ -1012,7 +1409,7 @@ class FilteredPathVisualizer:
                 'z': raw_z
             }
             
-            # 滤波处理（三步滤波流程）
+            # 滤波处理（支持两步或三步滤波流程）
             filtered = self.data_filter.filter(
                 data['distance_cm'], 
                 data['azimuth_deg'],
@@ -1033,7 +1430,10 @@ class FilteredPathVisualizer:
                     'distance': filtered['distance'],
                     'x': filt_x,
                     'y': filt_y,
-                    'z': filt_z
+                    'z': filt_z,
+                    'vx': filtered.get('vx', 0),
+                    'vy': filtered.get('vy', 0),
+                    'vz': filtered.get('vz', 0)
                 }
         
         # 移除过期路径点
@@ -1090,30 +1490,70 @@ class FilteredPathVisualizer:
                 f"Y坐标:   {self.last_filtered_data['y']:>8.1f} cm\n"
                 f"Z坐标:   {self.last_filtered_data['z']:>8.1f} cm"
             )
+            # 如果启用了EKF，显示速度信息
+            if self.use_ekf:
+                speed = math.sqrt(
+                    self.last_filtered_data['vx']**2 + 
+                    self.last_filtered_data['vy']**2 + 
+                    self.last_filtered_data['vz']**2
+                )
+                info_text += (
+                    f"\n\n━━━ EKF速度估计 ━━━\n\n"
+                    f"Vx:      {self.last_filtered_data['vx']:>8.1f} cm/s\n"
+                    f"Vy:      {self.last_filtered_data['vy']:>8.1f} cm/s\n"
+                    f"Vz:      {self.last_filtered_data['vz']:>8.1f} cm/s\n"
+                    f"速度:    {speed:>8.1f} cm/s"
+                )
         else:
             info_text = "等待数据...\n\n请确保：\n1. 串口已连接\n2. 基站已上电\n3. 信标在范围内"
         
         self.info_box.set_text(info_text)
         
-        # 更新统计信息（三步滤波流程）
+        # 更新统计信息
         stats = self.data_filter.get_statistics()
+        
+        # 根据是否启用EKF显示不同的滤波流程
+        if self.use_ekf:
+            filter_steps = (
+                f"━━━ 滤波流程（EKF模式）━━━\n\n"
+                f"Step1: 物理约束检查\n"
+                f"  ├ 距离: {MIN_DISTANCE}-{MAX_DISTANCE}cm\n"
+                f"  └ 速度: <{MAX_VELOCITY}cm/s\n\n"
+                f"Step2: 中位数滤波\n"
+                f"  └ 窗口: {MEDIAN_WINDOW_SIZE}\n\n"
+                f"Step3: EKF状态估计\n"
+                f"  ├ 位置噪声: 0.5\n"
+                f"  ├ 速度噪声: 2.0\n"
+                f"  └ 测量噪声: 5.0\n\n"
+                f"🎯 EKF功能:\n"
+                f"  ├ 预测目标位置\n"
+                f"  ├ 估计移动速度\n"
+                f"  └ 数据丢失时预测"
+            )
+        else:
+            filter_steps = (
+                f"━━━ 滤波流程（标准模式）━━━\n\n"
+                f"Step1: 物理约束检查\n"
+                f"  ├ 距离: {MIN_DISTANCE}-{MAX_DISTANCE}cm\n"
+                f"  └ 速度: <{MAX_VELOCITY}cm/s\n\n"
+                f"Step2: 中位数滤波\n"
+                f"  └ 窗口: {MEDIAN_WINDOW_SIZE}\n\n"
+                f"💡 提示:\n"
+                f"  使用 --ekf 参数\n"
+                f"  启用EKF扩展卡尔曼\n"
+                f"  滤波获取速度估计"
+            )
+        
         stats_text = (
-            f"━━━ 三步滤波统计 ━━━\n\n"
+            f"━━━ 滤波统计 ━━━\n\n"
             f"总数据点:  {stats['total_count']:>6d}\n"
             f"异常值:    {stats['outlier_count']:>6d}\n"
             f"├ 范围异常: {stats['reject_range']:>5d}\n"
             f"├ 速度异常: {stats['reject_velocity']:>5d}\n"
             f"有效数据:  {stats['valid_count']:>6d}\n"
-            f"异常率:    {stats['outlier_rate']:>6s}\n\n"
-            f"━━━ 三步滤波流程 ━━━\n\n"
-            f"Step1: 物理约束检查\n"
-            f"  ├ 距离: {MIN_DISTANCE}-{MAX_DISTANCE}cm\n"
-            f"  └ 速度: <{MAX_VELOCITY}cm/s\n\n"
-            f"Step2: 中位数滤波\n"
-            f"  └ 窗口: {MEDIAN_WINDOW_SIZE}\n\n"
-            f"Step3: 卡尔曼平滑\n"
-            f"  ├ Q: 0.15\n"
-            f"  └ R: 0.4\n\n"
+            f"异常率:    {stats['outlier_rate']:>6s}\n"
+            f"EKF状态:   {'✓ 启用' if self.use_ekf else '✗ 禁用'}\n\n"
+            f"{filter_steps}\n\n"
             f"━━━━━━━━━━━━━━━━\n\n"
             f"🔴 红色：原始数据\n"
             f"🔵 蓝色：滤波数据\n"
@@ -1194,22 +1634,31 @@ def print_usage():
 ║     UWB单基站跟随套件 - 原始数据与滤波数据对比可视化程序           ║
 ╠════════════════════════════════════════════════════════════════════╣
 ║                                                                    ║
-║  用法：python uwb_filtered_visualizer.py [选项]                    ║
+║  用法：python uwb_filtered_visualizer.py [选项] [串口号]           ║
 ║                                                                    ║
 ║  选项：                                                            ║
 ║    <串口号>      指定串口，如 COM3 或 /dev/ttyUSB0                 ║
 ║    --list        列出所有可用串口                                  ║
 ║    --simulate    使用模拟数据（含异常值，测试滤波效果）            ║
+║    --ekf         启用EKF扩展卡尔曼滤波（位置+速度状态估计）        ║
 ║    --help        显示此帮助信息                                    ║
 ║                                                                    ║
 ║  示例：                                                            ║
 ║    python uwb_filtered_visualizer.py COM3                          ║
 ║    python uwb_filtered_visualizer.py --simulate                    ║
+║    python uwb_filtered_visualizer.py --simulate --ekf              ║
+║    python uwb_filtered_visualizer.py COM3 --ekf                    ║
 ║                                                                    ║
 ║  功能：                                                            ║
 ║    同时显示原始数据和滤波后数据的三个二维平面视图                  ║
 ║    - 上排（红色）：原始数据的俯视图、前视图、侧视图                ║
 ║    - 下排（蓝色）：滤波后数据的俯视图、前视图、侧视图              ║
+║                                                                    ║
+║  EKF扩展卡尔曼滤波（--ekf 参数）：                                 ║
+║    - 传感器数据已自带KF，但EKF可以额外提供：                       ║
+║    - 状态估计：结合运动模型预测目标位置                            ║
+║    - 速度估计：输出目标移动速度（用于机器狗控制）                  ║
+║    - 预测功能：数据丢失时可预测目标位置                            ║
 ║                                                                    ║
 ║  依赖安装：                                                        ║
 ║    pip install pyserial matplotlib numpy                           ║
@@ -1231,29 +1680,42 @@ def main():
             print(f"\n提示：请指定串口号或使用模拟模式：")
             print(f"  python {sys.argv[0]} {ports[0]}")
             print(f"  python {sys.argv[0]} --simulate")
+            print(f"  python {sys.argv[0]} --simulate --ekf  # 启用EKF")
         return
     
-    arg = sys.argv[1]
+    # 解析命令行参数
+    use_ekf = '--ekf' in sys.argv
+    use_simulate = '--simulate' in sys.argv
     
-    if arg in ['--help', '-h']:
+    # 过滤掉选项，获取串口号
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    
+    if '--help' in sys.argv or '-h' in sys.argv:
         print_usage()
         return
     
-    if arg == '--list':
+    if '--list' in sys.argv:
         list_serial_ports()
         return
     
-    if arg == '--simulate':
+    if use_simulate:
         print("\n" + "="*60)
         print("    模拟模式 - 含异常值，测试滤波效果")
+        if use_ekf:
+            print("    ✓ EKF扩展卡尔曼滤波已启用（位置+速度状态估计）")
         print("="*60)
         receiver = SimulatedReceiver()
-    else:
-        port = arg
+    elif args:
+        port = args[0]
         print("\n" + "="*60)
         print(f"    UWB 原始数据 vs 滤波数据 对比 - 串口 {port}")
+        if use_ekf:
+            print("    ✓ EKF扩展卡尔曼滤波已启用（位置+速度状态估计）")
         print("="*60)
         receiver = SerialReceiver(port)
+    else:
+        print_usage()
+        return
     
     if not receiver.connect():
         return
@@ -1262,7 +1724,7 @@ def main():
         receiver.disconnect()
         return
     
-    visualizer = FilteredPathVisualizer(receiver)
+    visualizer = FilteredPathVisualizer(receiver, use_ekf=use_ekf)
     
     try:
         visualizer.run()
