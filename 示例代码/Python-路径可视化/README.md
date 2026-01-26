@@ -7,7 +7,7 @@
 | 程序 | 说明 |
 |------|------|
 | `uwb_path_visualizer.py` | 基础版：三个二维平面显示原始数据 |
-| `uwb_filtered_visualizer.py` | **对比版（推荐）**：原始数据 vs 滤波数据，含EKF速度估计 |
+| `uwb_filtered_visualizer.py` | **低延迟优化版（推荐）**：原始数据 vs 滤波数据，含EKF速度估计 |
 
 ---
 
@@ -37,17 +37,36 @@ python uwb_path_visualizer.py /dev/ttyUSB0
 
 # 2. 滤波对比可视化程序 (uwb_filtered_visualizer.py) 【推荐】
 
-**同时显示原始数据和滤波后数据**，用于直观对比滤波效果。
+**低延迟优化版**：同时显示原始数据和滤波后数据，用于直观对比滤波效果。
+
+## 优化特性（参考UWB code文件夹）
+
+- ✅ **非阻塞串口读取** (timeout=0) - 降低延迟
+- ✅ **批量数据处理** - 提高效率
+- ✅ **心跳包检测** (0x2002) - 监测信标离线状态
+- ✅ **角度突变抑制** - 抑制人员遮挡导致的角度跳变
 
 ## 滤波流程
 
-程序整合了完整的三步滤波流程：
+程序整合了完整的四步滤波流程：
 
 | 步骤 | 方法 | 说明 |
 |------|------|------|
 | Step 1 | 物理约束检查 | 范围限制（距离5-5000cm）+ 速度限制（最大300cm/s）|
-| Step 2 | 中位数滤波 | 窗口大小5，消除尖峰异常值 |
-| Step 3 | EKF状态估计 | 位置平滑 + 速度估计 |
+| Step 2 | 角度突变抑制 | 阈值10°，抑制人员遮挡导致的角度突变 |
+| Step 3 | 中位数滤波 | 窗口大小5，消除尖峰异常值 |
+| Step 4 | EKF状态估计 | 位置平滑 + 速度估计 |
+
+## 角度突变抑制器 (AngleSmoother)
+
+来自UWB code文件夹的关键优化技术，用于抑制人员遮挡导致的角度突变：
+
+```
+规则：
+- 当 αk - αk-1 > 10°:  αexport = αk-1, dexport = dk-1 + 2
+- 当 αk - αk-1 < -10°: αexport = αk-1, dexport = dk-1 - 2
+- 当 |αk - αk-1| ≤ 10°: αexport = αk, dexport = dk
+```
 
 ## EKF扩展卡尔曼滤波
 
@@ -108,7 +127,8 @@ python uwb_filtered_visualizer.py --list
 
 ### 统计信息
 - 总数据量
-- 异常值数量
+- 物理约束异常数
+- 角度突变抑制数
 - 有效数据量
 - 异常率
 
@@ -118,3 +138,4 @@ python uwb_filtered_visualizer.py --list
 
 - 《Probabilistic Robotics》 (Thrun, Burgard, Fox)
 - scipy.signal (medfilt, lfilter)
+- UWB code 文件夹（低延迟优化技术）

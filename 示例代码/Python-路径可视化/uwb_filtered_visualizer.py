@@ -2,17 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================================
-UWB单基站跟随套件 - 数据滤波对比可视化程序
+UWB单基站跟随套件 - 数据滤波对比可视化程序（低延迟优化版）
 ============================================================================
 
 功能说明：
     同时显示原始数据和滤波后数据的三个二维平面视图，用于对比滤波效果。
-    滤波流程已整合EKF扩展卡尔曼滤波，用于目标跟踪和速度估计。
+    整合多种滤波技术，用于目标跟踪和速度估计。
+
+优化特性（参考UWB code文件夹）：
+    • 非阻塞串口读取 (timeout=0)
+    • 批量数据处理
+    • 角度突变抑制器 - 抑制人员遮挡导致的角度突变
+    • 心跳包支持 - 检测信标离线状态
 
 滤波流程：
     Step 1: 物理约束检查 - 范围限制 + 速度限制
-    Step 2: 中位数滤波 - 消除尖峰异常值
-    Step 3: EKF状态估计 - 位置平滑 + 速度估计
+    Step 2: 角度突变抑制 - 抑制角度突变（阈值10°）
+    Step 3: 中位数滤波 - 消除尖峰异常值
+    Step 4: EKF状态估计 - 位置平滑 + 速度估计
 
 使用方法：
     python uwb_filtered_visualizer.py <串口号>
@@ -82,53 +89,99 @@ MAX_ELEVATION = 90.0        # 最大仰角 (度)
 # 滤波参数 - 中位数滤波
 MEDIAN_WINDOW_SIZE = 5      # 中位数滤波窗口大小
 
+# 滤波参数 - 角度突变抑制
+ANGLE_THRESHOLD = 10.0      # 角度突变阈值（度），超过此阈值视为异常
+
 # 滤波参数 - EKF
 EKF_PROCESS_NOISE = 0.5     # EKF过程噪声
 EKF_MEASUREMENT_NOISE = 1.0 # EKF测量噪声
 
 
 # ============================================================================
-# 数据解析器
+# 数据解析器（优化版：支持心跳包检测）
 # ============================================================================
 
 class UWBDataParser:
-    """UWB数据帧解析器"""
+    """UWB数据帧解析器（低延迟优化版）"""
     
     FRAME_HEADER = b'\xff\xff\xff\xff'
-    FRAME_LENGTH = 37
-    CMD_LOCATION = 0x2001
+    CMD_LOCATION = 0x2001   # 定位数据包
+    CMD_HEARTBEAT = 0x2002  # 心跳包
     
     def __init__(self):
-        self.buffer = b''
+        self.buffer = bytearray()
+        self.heartbeat_count = 0
+        self.location_count = 0
+        self.last_heartbeat_time = None
+        self.last_location_time = None
+        self.offline_warning_shown = False
     
     def parse(self, data: bytes) -> list:
-        """解析数据，返回解析结果列表"""
-        self.buffer += data
+        """解析数据，返回解析结果列表（批量处理优化）"""
+        self.buffer.extend(data)
         results = []
         
-        while True:
-            idx = self.buffer.find(self.FRAME_HEADER)
-            if idx < 0:
-                self.buffer = b''
+        while len(self.buffer) >= 6:
+            # 查找帧头
+            header_idx = self.buffer.find(self.FRAME_HEADER)
+            
+            if header_idx < 0:
+                self.buffer.clear()
                 break
             
-            if idx > 0:
-                self.buffer = self.buffer[idx:]
+            # 丢弃帧头之前的无效数据
+            if header_idx > 0:
+                self.buffer = self.buffer[header_idx:]
             
-            if len(self.buffer) < self.FRAME_LENGTH:
+            # 检查是否有足够数据读取长度字段
+            if len(self.buffer) < 6:
                 break
             
-            frame = self.buffer[:self.FRAME_LENGTH]
-            self.buffer = self.buffer[self.FRAME_LENGTH:]
+            # 读取包长度
+            packet_length = struct.unpack('>H', self.buffer[4:6])[0]
             
-            result = self._parse_frame(frame)
-            if result:
-                results.append(result)
+            # 检查缓冲区是否有完整的包
+            if len(self.buffer) < packet_length:
+                break
+            
+            # 提取完整数据包
+            frame = bytes(self.buffer[:packet_length])
+            self.buffer = self.buffer[packet_length:]
+            
+            # 根据长度判断数据包类型
+            if packet_length == 16:
+                # 心跳包
+                self._parse_heartbeat(frame)
+            elif packet_length == 37:
+                # 定位数据包
+                result = self._parse_location(frame)
+                if result:
+                    results.append(result)
         
         return results
     
-    def _parse_frame(self, frame: bytes) -> Optional[Dict]:
-        """解析单帧数据"""
+    def _parse_heartbeat(self, frame: bytes):
+        """解析心跳包"""
+        try:
+            cmd = struct.unpack('>H', frame[8:10])[0]
+            if cmd != self.CMD_HEARTBEAT:
+                return
+            
+            self.heartbeat_count += 1
+            self.last_heartbeat_time = time.time()
+            
+            # 检测信标是否离线（有心跳但超过5秒无定位数据）
+            if self.last_location_time is not None:
+                time_since_location = time.time() - self.last_location_time
+                if time_since_location > 5 and not self.offline_warning_shown:
+                    print(f"\n⚠️ 警告：已收到 {self.heartbeat_count} 个心跳包，"
+                          f"但 {time_since_location:.1f} 秒内无定位数据，信标可能已关闭！")
+                    self.offline_warning_shown = True
+        except Exception:
+            pass
+    
+    def _parse_location(self, frame: bytes) -> Optional[Dict]:
+        """解析定位数据包"""
         try:
             # 验证校验和
             calculated_xor = 0
@@ -157,6 +210,14 @@ class UWBDataParser:
             y = distance_cm * math.cos(el_rad) * math.cos(az_rad)
             z = distance_cm * math.sin(el_rad)
             
+            self.location_count += 1
+            self.last_location_time = time.time()
+            
+            # 信标恢复在线，重置警告标志
+            if self.offline_warning_shown:
+                print(f"\n✅ 信标已恢复在线！")
+                self.offline_warning_shown = False
+            
             return {
                 'anchor_id': anchor_id,
                 'tag_id': tag_id,
@@ -173,11 +234,11 @@ class UWBDataParser:
 
 
 # ============================================================================
-# 串口接收器
+# 串口接收器（低延迟优化版）
 # ============================================================================
 
 class SerialReceiver:
-    """串口数据接收器"""
+    """串口数据接收器（非阻塞低延迟版）"""
     
     def __init__(self, port: str, baudrate: int = 115200):
         self.port = port
@@ -189,7 +250,7 @@ class SerialReceiver:
         self.thread = None
     
     def connect(self) -> bool:
-        """连接串口"""
+        """连接串口（非阻塞模式）"""
         try:
             self.serial = serial.Serial(
                 port=self.port,
@@ -197,10 +258,15 @@ class SerialReceiver:
                 bytesize=serial.EIGHTBITS,
                 stopbits=serial.STOPBITS_ONE,
                 parity=serial.PARITY_NONE,
-                timeout=0.1
+                timeout=0  # 非阻塞模式，降低延迟
             )
-            print(f"✓ 串口 {self.port} 已连接")
+            print(f"✓ 串口 {self.port} 已连接（低延迟模式）")
             print(f"  波特率: {self.baudrate}")
+            print("  优化特性:")
+            print("    • 非阻塞串口读取")
+            print("    • 批量数据处理")
+            print("    • 心跳包检测")
+            print(f"    • 角度突变抑制 (阈值: {ANGLE_THRESHOLD}°)")
             return True
         except Exception as e:
             print(f"✗ 串口连接失败: {e}")
@@ -228,9 +294,10 @@ class SerialReceiver:
         return True
     
     def _receive_loop(self):
-        """数据接收循环"""
+        """数据接收循环（优化版：一次性读取所有可用数据）"""
         while self.running:
             try:
+                # 一次性读取所有可用数据，减少延迟
                 if self.serial.in_waiting > 0:
                     data = self.serial.read(self.serial.in_waiting)
                     results = self.parser.parse(data)
@@ -238,7 +305,7 @@ class SerialReceiver:
                         self.data_queue.append(result)
             except Exception:
                 pass
-            time.sleep(0.01)
+            time.sleep(0.005)  # 5ms检查间隔，平衡延迟和CPU占用
     
     def get_latest_data(self) -> Optional[Dict]:
         """获取最新数据"""
@@ -251,6 +318,80 @@ class SerialReceiver:
         data_list = list(self.data_queue)
         self.data_queue.clear()
         return data_list
+
+
+# ============================================================================
+# 角度突变抑制器（来自UWB code文件夹的优化技术）
+# ============================================================================
+
+class AngleSmoother:
+    """
+    角度突变抑制器
+    
+    抑制规则（当角度变化超过阈值时）：
+    - αk - αk-1 > threshold:  αexport = αk-1, dexport = dk-1 + 2
+    - αk - αk-1 < -threshold: αexport = αk-1, dexport = dk-1 - 2
+    - |αk - αk-1| ≤ threshold: αexport = αk, dexport = dk
+    
+    这种方法可以有效抑制人员遮挡导致的角度突变。
+    """
+    
+    def __init__(self, threshold: float = ANGLE_THRESHOLD):
+        """
+        初始化角度平滑器
+        :param threshold: 角度突变阈值（度），默认10°
+        """
+        self.threshold = threshold
+        self.prev_angle = None
+        self.prev_distance = None
+        self.suppressed_count = 0
+    
+    def process(self, angle: float, distance: float) -> Tuple[float, float]:
+        """
+        处理角度和距离，抑制角度突变
+        
+        :param angle: 当前角度 αk
+        :param distance: 当前距离 dk
+        :return: (αexport, dexport) 输出角度和距离
+        """
+        if angle is None or distance is None:
+            return angle, distance
+        
+        # 首次数据，直接输出
+        if self.prev_angle is None or self.prev_distance is None:
+            self.prev_angle = angle
+            self.prev_distance = distance
+            return angle, distance
+        
+        # 计算角度变化
+        delta_angle = angle - self.prev_angle
+        
+        if delta_angle > self.threshold:
+            # 角度正向突变超过阈值
+            angle_export = self.prev_angle
+            distance_export = self.prev_distance + 2
+            self.suppressed_count += 1
+        elif delta_angle < -self.threshold:
+            # 角度负向突变超过阈值
+            angle_export = self.prev_angle
+            distance_export = self.prev_distance - 2
+            self.suppressed_count += 1
+        else:
+            # 角度变化在阈值范围内，正常输出
+            angle_export = angle
+            distance_export = distance
+        
+        # 更新上一时刻的值（使用原始UWB数据）
+        self.prev_angle = angle
+        self.prev_distance = distance
+        
+        return angle_export, distance_export
+    
+    def reset(self):
+        """重置"""
+        self.prev_angle = None
+        self.prev_distance = None
+        self.suppressed_count = 0
 
 
 # ============================================================================
@@ -475,7 +616,7 @@ class PhysicalConstraintChecker:
 
 
 # ============================================================================
-# 综合滤波器
+# 综合滤波器（整合角度突变抑制）
 # ============================================================================
 
 class UWBDataFilter:
@@ -484,13 +625,17 @@ class UWBDataFilter:
     
     滤波流程：
         1. 物理约束检查
-        2. 中位数滤波
-        3. EKF状态估计
+        2. 角度突变抑制（新增）
+        3. 中位数滤波
+        4. EKF状态估计
     """
     
     def __init__(self):
         # 物理约束检查器
         self.constraint_checker = PhysicalConstraintChecker(MAX_VELOCITY)
+        
+        # 角度突变抑制器（新增）
+        self.angle_smoother = AngleSmoother(ANGLE_THRESHOLD)
         
         # 中位数滤波器
         self.median_filter = MedianFilter3D(MEDIAN_WINDOW_SIZE)
@@ -501,6 +646,7 @@ class UWBDataFilter:
         # 统计
         self.total_count = 0
         self.outlier_count = 0
+        self.angle_suppressed_count = 0
         self.last_valid_result = None
     
     def filter(self, distance: float, azimuth: float, elevation: float,
@@ -513,7 +659,9 @@ class UWBDataFilter:
             {
                 'x', 'y', 'z': 滤波后位置,
                 'vx', 'vy', 'vz': 速度估计,
-                'is_outlier': 是否为异常值
+                'is_outlier': 是否为异常值,
+                'angle_smoothed': 平滑后角度,
+                'distance_smoothed': 平滑后距离
             }
         """
         if current_time is None:
@@ -532,10 +680,21 @@ class UWBDataFilter:
                 return {**self.last_valid_result, 'is_outlier': True}
             return None
         
-        # Step 2: 中位数滤波
-        med_x, med_y, med_z = self.median_filter.update(x, y, z)
+        # Step 2: 角度突变抑制（新增）
+        smoothed_azimuth, smoothed_distance = self.angle_smoother.process(azimuth, distance)
+        self.angle_suppressed_count = self.angle_smoother.suppressed_count
         
-        # Step 3: EKF状态估计
+        # 使用平滑后的数据重新计算坐标
+        az_rad = math.radians(smoothed_azimuth)
+        el_rad = math.radians(elevation)
+        smooth_x = smoothed_distance * math.cos(el_rad) * math.sin(az_rad)
+        smooth_y = smoothed_distance * math.cos(el_rad) * math.cos(az_rad)
+        smooth_z = smoothed_distance * math.sin(el_rad)
+        
+        # Step 3: 中位数滤波
+        med_x, med_y, med_z = self.median_filter.update(smooth_x, smooth_y, smooth_z)
+        
+        # Step 4: EKF状态估计
         ekf_result = self.ekf.update(med_x, med_y, med_z, current_time)
         
         result = {
@@ -545,7 +704,9 @@ class UWBDataFilter:
             'vx': ekf_result['vx'],
             'vy': ekf_result['vy'],
             'vz': ekf_result['vz'],
-            'is_outlier': False
+            'is_outlier': False,
+            'angle_smoothed': smoothed_azimuth,
+            'distance_smoothed': smoothed_distance
         }
         
         self.last_valid_result = result
@@ -558,16 +719,19 @@ class UWBDataFilter:
             'total': self.total_count,
             'outlier': self.outlier_count,
             'valid': self.total_count - self.outlier_count,
-            'outlier_rate': f"{rate * 100:.1f}%"
+            'outlier_rate': f"{rate * 100:.1f}%",
+            'angle_suppressed': self.angle_suppressed_count
         }
     
     def reset(self):
         """重置"""
         self.constraint_checker.reset()
+        self.angle_smoother.reset()
         self.median_filter.reset()
         self.ekf.reset()
         self.total_count = 0
         self.outlier_count = 0
+        self.angle_suppressed_count = 0
         self.last_valid_result = None
 
 
@@ -760,14 +924,16 @@ Vz: {self.last_filtered.get('vz', 0):.1f} cm/s"""
 
 滤波流程:
   1. 物理约束检查
-  2. 中位数滤波(窗口={MEDIAN_WINDOW_SIZE})
-  3. EKF状态估计
+  2. 角度突变抑制(阈值={ANGLE_THRESHOLD}°)
+  3. 中位数滤波(窗口={MEDIAN_WINDOW_SIZE})
+  4. EKF状态估计
 
 数据统计:
-  总数据:   {stats['total']}
-  异常值:   {stats['outlier']}
-  有效数据: {stats['valid']}
-  异常率:   {stats['outlier_rate']}
+  总数据:     {stats['total']}
+  物理约束异常: {stats['outlier']}
+  角度突变抑制: {stats['angle_suppressed']}
+  有效数据:   {stats['valid']}
+  异常率:     {stats['outlier_rate']}
 
 参数设置:
   最大速度: {MAX_VELOCITY} cm/s
@@ -819,7 +985,7 @@ def print_usage():
     """打印使用说明"""
     print("""
 ============================================================================
-     UWB单基站跟随套件 - 数据滤波对比可视化程序
+     UWB单基站跟随套件 - 数据滤波对比可视化程序（低延迟优化版）
 ============================================================================
 
 用法：python uwb_filtered_visualizer.py <串口号>
@@ -838,10 +1004,17 @@ def print_usage():
   - 下排（蓝色）：滤波后数据的三个二维平面视图
   - 整合EKF扩展卡尔曼滤波，输出速度估计
 
+优化特性（参考UWB code文件夹）：
+  • 非阻塞串口读取 - 降低延迟
+  • 批量数据处理 - 提高效率
+  • 心跳包检测 - 监测信标状态
+  • 角度突变抑制 - 抑制人员遮挡导致的角度跳变
+
 滤波流程：
   1. 物理约束检查（范围+速度限制）
-  2. 中位数滤波（窗口=5）
-  3. EKF状态估计（位置+速度）
+  2. 角度突变抑制（阈值=10°）
+  3. 中位数滤波（窗口=5）
+  4. EKF状态估计（位置+速度）
 
 依赖安装：
   pip install pyserial matplotlib numpy
@@ -876,9 +1049,9 @@ def main():
     
     # 连接串口
     port = arg
-    print("\n" + "="*60)
-    print(f"    UWB 数据滤波对比可视化 - 串口 {port}")
-    print("="*60)
+    print("\n" + "="*70)
+    print(f"    UWB 数据滤波对比可视化（低延迟优化版）- 串口 {port}")
+    print("="*70)
     
     receiver = SerialReceiver(port)
     
