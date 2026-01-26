@@ -67,10 +67,10 @@ FRAME_LENGTH = 37                    # 数据帧长度（字节）
 CMD_POSITION = 0x2001                # 位置数据命令字
 
 # 可视化配置
-MAX_PATH_POINTS = 100       # 最大保留路径点数
-UPDATE_INTERVAL = 50        # 图形更新间隔（毫秒）
+MAX_PATH_POINTS = 1000       # 最大保留路径点数
+UPDATE_INTERVAL = 25        # 图形更新间隔（毫秒）
 DISPLAY_RANGE = 200         # 默认显示范围（厘米）
-PATH_FADE_TIME = 5.0        # 路径渐隐时间（秒）
+PATH_FADE_TIME = 50.0        # 路径渐隐时间（秒）
 
 
 # ============================================================================
