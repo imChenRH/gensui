@@ -1,13 +1,15 @@
 # UWB单基站跟随套件 - 路径可视化程序
 
-本目录包含两个可视化程序：
+本目录包含多个可视化程序：
 
 ## 程序列表
 
 | 程序 | 说明 |
 |------|------|
 | `uwb_path_visualizer.py` | 基础版：三个二维平面显示原始数据 |
-| `uwb_filtered_visualizer.py` | **低延迟优化版（推荐）**：原始数据 vs 滤波数据，含EKF速度估计 |
+| `uwb_filtered_visualizer.py` | **三维版（推荐）**：原始数据 vs 滤波数据，含3D-EKF速度估计 |
+| `uwb_filtered_visualizer忽略仰角版.py` | **二维简化版**：忽略仰角，直线距离=平地距离 |
+| `uwb_filtered_visualizer_2d.py` | 同上，英文文件名版本 |
 
 ---
 
@@ -131,6 +133,42 @@ python uwb_filtered_visualizer.py --list
 - 角度突变抑制数
 - 有效数据量
 - 异常率
+
+---
+
+# 3. 二维简化版（忽略仰角）
+
+`uwb_filtered_visualizer忽略仰角版.py` / `uwb_filtered_visualizer_2d.py`
+
+## 特点
+
+- ✅ **忽略仰角**：直接将直线距离视作平地距离
+- ✅ **简化坐标转换**：X = Distance × sin(Azimuth), Y = Distance × cos(Azimuth)
+- ✅ **只显示俯视图**：X-Y平面
+- ✅ **2D-EKF**：只估计二维位置和速度 (Vx, Vy)
+
+## 适用场景
+
+- 信标和基站在同一水平面上
+- 不需要高度信息
+- 机器狗在平地跟随
+
+## 使用方法
+
+```bash
+python uwb_filtered_visualizer忽略仰角版.py COM3
+# 或者
+python uwb_filtered_visualizer_2d.py COM3
+```
+
+## 界面布局
+
+```
+┌─────────────────────┬─────────────────────┬─────────────────────┐
+│ 原始数据-俯视图     │ 滤波数据-俯视图     │ 实时数据和统计      │
+│     （红色）        │     （蓝色）        │                     │
+└─────────────────────┴─────────────────────┴─────────────────────┘
+```
 
 ---
 
