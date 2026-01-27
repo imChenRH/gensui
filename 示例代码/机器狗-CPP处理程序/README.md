@@ -2,7 +2,7 @@
 
 ## 概述
 
-本程序用于机器狗接收UWB基站数据，进行数据滤波处理，输出用于跟随控制的X、Y坐标值。
+本程序用于机器狗接收UWB基站数据，进行数据滤波处理，实现跟随人的功能。
 
 **已封装为库**，方便跟随程序调用！
 
@@ -16,6 +16,7 @@
 |------|------|
 | `uwb_follower.h` | **库头文件** - 包含此文件即可使用 |
 | `uwb_follower.cpp` | **库实现文件** - 编译时需链接 |
+| `dog_follow_human.cpp` | **跟随控制程序** - 完整的2.5米跟随实现 |
 | `example_usage.cpp` | 使用示例代码 |
 | `uwb_dog_follower.cpp` | 独立版完整程序 |
 
@@ -219,3 +220,74 @@ const double EKF_MEASUREMENT_NOISE = 1.0;  // 测量噪声
 ## 作者
 
 Copilot @ 2026-01-27
+
+---
+
+## 🎯 跟随控制程序 (dog_follow_human.cpp)
+
+### 功能
+
+实现机器狗以约**2.5米**距离跟随人，并始终朝向人。
+
+### 控制逻辑
+
+1. **获取UWB位置** - 使用`UWBFollower`库获取人的位置(x, y)
+2. **距离控制** - 保持与目标人2.5米（250cm）的距离
+3. **角度控制** - 始终转向面对目标人
+4. **速度输出** - 通过`dog.move(x_speed, y_speed, angular_speed)`控制
+
+### 控制参数
+
+```cpp
+// 跟随距离
+TARGET_DISTANCE = 250.0 cm     // 目标距离：2.5米
+DISTANCE_TOLERANCE = 30.0 cm   // 距离容差
+
+// 速度限制
+MAX_LINEAR_SPEED = 0.8 m/s     // 最大线速度
+MAX_ANGULAR_SPEED = 1.2 rad/s  // 最大角速度
+
+// 安全参数
+STOP_DISTANCE = 100.0 cm       // 太近时停止
+LOST_DISTANCE = 1000.0 cm      // 太远时停止跟随
+```
+
+### 编译运行
+
+```bash
+# 编译
+g++ dog_follow_human.cpp uwb_follower.cpp -o dog_follow_human -std=c++11 -lm
+
+# 运行
+./dog_follow_human /dev/ttyUSB0
+```
+
+### 输出示例
+
+```
+============================================
+UWB机器狗跟随程序 启动
+============================================
+串口设备: /dev/ttyUSB0
+目标距离: 250 cm
+按 Ctrl+C 退出
+============================================
+
+[信息] UWB串口已连接
+[机器狗] 初始化完成
+[信息] 开始跟随控制循环...
+[跟随] 检测到目标，开始跟随 (距离=320cm, 角度=15°)
+[状态] 距离=320cm 角度=15.0° | 速度: X=0.35 Y=0.00 W=0.45 | 跟随中
+[状态] 距离=280cm 角度=8.2° | 速度: X=0.15 Y=0.00 W=0.25 | 跟随中
+[状态] 距离=252cm 角度=2.1° | 速度: X=0.00 Y=0.00 W=0.00 | 跟随中
+```
+
+### 如何集成到您的机器狗SDK
+
+在`dog_follow_human.cpp`中找到`RobotDog`类，将`move()`函数替换为您的机器狗SDK：
+
+```cpp
+void move(double x_speed, double y_speed, double angular_speed) {
+    // TODO: 替换为您的机器狗SDK
+    // 例如：your_robot_sdk.setVelocity(x_speed, y_speed, angular_speed);
+}
