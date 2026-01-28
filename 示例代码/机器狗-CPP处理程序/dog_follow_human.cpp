@@ -75,6 +75,11 @@ namespace FollowConfig {
     
     // 控制频率
     constexpr int CONTROL_PERIOD_MS = 50;          // 控制周期 (ms)
+    
+    // 速度平滑参数（指数移动平均）
+    // alpha越小，平滑效果越强，响应越慢；alpha越大，响应越快，平滑效果越弱
+    constexpr double RADIAL_SMOOTH_ALPHA = 0.3;    // 径向速度平滑系数 (0.0-1.0)
+    constexpr double ANGULAR_SMOOTH_ALPHA = 0.4;   // 角向速度平滑系数 (0.0-1.0)
 }
 
 // ============================================================================
@@ -166,7 +171,10 @@ public:
         : lost_frame_count_(0)
         , is_following_(false)
         , radial_at_max_speed_(false)
-        , angular_at_max_speed_(false) {
+        , angular_at_max_speed_(false)
+        , prev_radial_speed_(0.0)
+        , prev_angular_speed_(0.0)
+        , first_frame_(true) {
     }
     
     /**
@@ -355,6 +363,26 @@ public:
             angular_at_max_speed_ = false;
         }
         
+        // ============== 速度平滑处理 ==============
+        
+        if (first_frame_) {
+            // 第一帧不平滑，直接使用计算值
+            prev_radial_speed_ = x_speed;
+            prev_angular_speed_ = angular_speed;
+            first_frame_ = false;
+        } else {
+            // 使用指数移动平均进行平滑
+            // smoothed = alpha * current + (1 - alpha) * previous
+            x_speed = FollowConfig::RADIAL_SMOOTH_ALPHA * x_speed 
+                    + (1.0 - FollowConfig::RADIAL_SMOOTH_ALPHA) * prev_radial_speed_;
+            angular_speed = FollowConfig::ANGULAR_SMOOTH_ALPHA * angular_speed 
+                          + (1.0 - FollowConfig::ANGULAR_SMOOTH_ALPHA) * prev_angular_speed_;
+            
+            // 更新上一次速度
+            prev_radial_speed_ = x_speed;
+            prev_angular_speed_ = angular_speed;
+        }
+        
         // ============== 侧向运动（可选） ==============
         
         // 如果人在侧面，可以添加侧移以更快接近
@@ -374,6 +402,9 @@ public:
         is_following_ = false;
         radial_at_max_speed_ = false;
         angular_at_max_speed_ = false;
+        prev_radial_speed_ = 0.0;
+        prev_angular_speed_ = 0.0;
+        first_frame_ = true;
     }
     
     /**
@@ -397,6 +428,11 @@ private:
     bool is_following_;
     bool radial_at_max_speed_;    // 径向是否在最大速度
     bool angular_at_max_speed_;   // 角向是否在最大角速度
+    
+    // 速度平滑变量
+    double prev_radial_speed_;    // 上一次径向速度
+    double prev_angular_speed_;   // 上一次角向速度
+    bool first_frame_;            // 是否是第一帧
 };
 
 // ============================================================================
