@@ -7,9 +7,13 @@
  * 
  * 功能说明：
  *     使用UWB定位系统实现机器狗跟随人的功能
- *     - 保持约2.5米的跟随距离
- *     - 始终朝向目标人
- *     - 平滑的速度控制
+ *     
+ *     控制逻辑（径向+角向分离控制）：
+ *     - 径向运动：当距离 > min_distance 时启动
+ *       * 跟随速度 = 人的径向速度 × 系数
+ *       * 系数是 (now_distance - min_distance) 的二次函数
+ *       * 超过最大速度时保持最大速度，直到距离 < 1.1 * min_distance
+ *     - 角向运动：同理
  * 
  * 使用方法：
  *     1. 将此文件与 uwb_follower.cpp 一起编译
@@ -22,7 +26,7 @@
  *     ./dog_follow_human /dev/ttyUSB0
  * 
  * 作者：Copilot
- * 日期：2026-01-27
+ * 日期：2026-01-28
  * ============================================================================
  */
 
@@ -38,25 +42,28 @@
 
 namespace FollowConfig {
     // 跟随距离参数
-    constexpr double TARGET_DISTANCE = 250.0;      // 目标跟随距离 (cm) = 2.5米
-    constexpr double DISTANCE_TOLERANCE = 30.0;    // 距离容差 (cm)，在此范围内不调整距离
+    constexpr double MIN_DISTANCE = 250.0;         // 最小跟随距离 (cm) = 2.5米，低于此距离机器狗不启动径向运动
+    constexpr double DISTANCE_DECEL_FACTOR = 1.1;  // 减速距离系数，当距离<1.1*MIN_DISTANCE时从最大速度减速
     
     // 角度参数
-    constexpr double ANGLE_TOLERANCE = 5.0;        // 角度容差 (度)，在此范围内不旋转
+    constexpr double MIN_ANGLE = 5.0;              // 最小启动角度 (度)，低于此角度不启动角向运动
+    constexpr double ANGLE_DECEL_FACTOR = 1.1;     // 减速角度系数
     
     // 速度限制
     constexpr double MAX_LINEAR_SPEED = 0.8;       // 最大线速度 (m/s)
     constexpr double MAX_ANGULAR_SPEED = 1.2;      // 最大角速度 (rad/s)
-    constexpr double MIN_LINEAR_SPEED = 0.1;       // 最小线速度 (m/s)
-    constexpr double MIN_ANGULAR_SPEED = 0.1;      // 最小角速度 (rad/s)
     
-    // PID控制参数 - 距离控制
-    constexpr double KP_DISTANCE = 0.005;          // 距离比例系数
-    constexpr double KD_DISTANCE = 0.001;          // 距离微分系数
+    // 二次函数系数 - 用于计算跟随系数
+    // 系数 = a * (distance_diff)^2 + b * (distance_diff) + c
+    // 当 distance_diff = 0 时，系数 = 0
+    // 当 distance_diff 增大时，系数增大
+    constexpr double RADIAL_COEFF_A = 0.00001;     // 径向二次系数
+    constexpr double RADIAL_COEFF_B = 0.005;       // 径向一次系数
+    constexpr double RADIAL_COEFF_C = 0.0;         // 径向常数项
     
-    // PID控制参数 - 角度控制
-    constexpr double KP_ANGLE = 0.03;              // 角度比例系数
-    constexpr double KD_ANGLE = 0.005;             // 角度微分系数
+    constexpr double ANGULAR_COEFF_A = 0.001;      // 角向二次系数
+    constexpr double ANGULAR_COEFF_B = 0.05;       // 角向一次系数
+    constexpr double ANGULAR_COEFF_C = 0.0;        // 角向常数项
     
     // 安全参数
     constexpr double STOP_DISTANCE = 100.0;        // 停止距离 (cm)，人太近时停止
@@ -142,21 +149,28 @@ public:
 /**
  * 跟随控制器
  * 实现基于UWB定位的人员跟随算法
+ * 
+ * 控制逻辑：
+ * 1. 径向运动：当距离 > min_distance 时启动
+ *    - 跟随速度 = 人的径向速度 × 系数
+ *    - 系数是 (now_distance - min_distance) 的二次函数
+ *    - 超过最大速度时保持最大速度，直到距离 < 1.1 * min_distance
+ * 2. 角向运动：同理
  */
 class FollowController {
 public:
     FollowController() 
-        : prev_distance_error_(0.0)
-        , prev_angle_error_(0.0)
-        , lost_frame_count_(0)
-        , is_following_(false) {
+        : lost_frame_count_(0)
+        , is_following_(false)
+        , radial_at_max_speed_(false)
+        , angular_at_max_speed_(false) {
     }
     
     /**
      * 计算控制指令
-     * @param uwb_data UWB位置数据
-     * @param x_speed 输出：X方向速度
-     * @param y_speed 输出：Y方向速度  
+     * @param uwb_data UWB位置数据（包含EKF估计的速度vx, vy）
+     * @param x_speed 输出：X方向速度 (前进方向)
+     * @param y_speed 输出：Y方向速度 (侧向)
      * @param angular_speed 输出：角速度
      * @return true = 数据有效，输出控制指令；false = 数据无效，应停止
      */
@@ -177,7 +191,7 @@ public:
                 }
                 return false;
             }
-            // 短暂丢失，保持上一次的控制（可以改为减速）
+            // 短暂丢失，保持上一次的控制
             return true;
         }
         
@@ -185,114 +199,156 @@ public:
         lost_frame_count_ = 0;
         
         // 获取当前距离和角度
-        double current_distance = uwb_data.distance_cm;
-        double current_angle = uwb_data.azimuth_deg;
+        double now_distance = uwb_data.distance_cm;
+        double now_angle = std::abs(uwb_data.azimuth_deg);  // 角度偏差的绝对值
+        double angle_sign = (uwb_data.azimuth_deg >= 0) ? 1.0 : -1.0;  // 角度方向
+        
+        // 获取EKF估计的人的速度
+        double human_vx = uwb_data.vx;  // X方向速度 (cm/s)
+        double human_vy = uwb_data.vy;  // Y方向速度 (cm/s)
+        
+        // 计算人的径向速度（沿着机器狗到人的方向）
+        double human_radial_speed = std::sqrt(human_vx * human_vx + human_vy * human_vy);
+        
+        // 计算人的角向速度（需要从xy速度分解）
+        // 使用arctan2计算人移动方向的角度变化率
+        double human_angular_speed = 0.0;
+        if (now_distance > 10.0) {  // 避免除以零
+            // 角速度近似 = (垂直于径向的速度分量) / 距离
+            // 假设x是左右方向，y是前后方向
+            // 角速度 = vx / distance (简化计算)
+            human_angular_speed = std::abs(human_vx) / now_distance * 57.3;  // 转换为度/秒
+        }
         
         // ============== 安全检查 ==============
         
         // 人太近，停止
-        if (current_distance < FollowConfig::STOP_DISTANCE) {
+        if (now_distance < FollowConfig::STOP_DISTANCE) {
             if (is_following_) {
-                std::cout << "[跟随] 人太近 (" << current_distance 
+                std::cout << "[跟随] 人太近 (" << now_distance 
                           << "cm)，停止并等待" << std::endl;
             }
             is_following_ = false;
+            radial_at_max_speed_ = false;
+            angular_at_max_speed_ = false;
             return true;  // 返回true但速度为0
         }
         
         // 人太远，停止
-        if (current_distance > FollowConfig::LOST_DISTANCE) {
+        if (now_distance > FollowConfig::LOST_DISTANCE) {
             if (is_following_) {
-                std::cout << "[跟随] 人太远 (" << current_distance 
+                std::cout << "[跟随] 人太远 (" << now_distance 
                           << "cm)，停止跟随" << std::endl;
             }
             is_following_ = false;
+            radial_at_max_speed_ = false;
+            angular_at_max_speed_ = false;
             return false;
         }
         
         // 开始跟随
         if (!is_following_) {
             std::cout << "[跟随] 检测到目标，开始跟随 (距离=" 
-                      << current_distance << "cm, 角度=" 
-                      << current_angle << "°)" << std::endl;
+                      << now_distance << "cm, 角度=" 
+                      << uwb_data.azimuth_deg << "°)" << std::endl;
             is_following_ = true;
         }
         
-        // ============== 计算控制量 ==============
+        // ============== 径向运动控制 ==============
         
-        // 距离误差（正值=需要前进，负值=需要后退）
-        double distance_error = current_distance - FollowConfig::TARGET_DISTANCE;
+        double distance_diff = now_distance - FollowConfig::MIN_DISTANCE;
         
-        // 角度误差（正值=人在左边需要左转，负值=人在右边需要右转）
-        // 方位角定义：正值=左边，负值=右边
-        double angle_error = current_angle;  // 目标是让角度归零（正对人）
-        
-        // ============== 角度控制（旋转） ==============
-        
-        // 如果角度偏差超过容差，则旋转
-        if (std::abs(angle_error) > FollowConfig::ANGLE_TOLERANCE) {
-            // PD控制计算角速度
-            double angle_deriv = angle_error - prev_angle_error_;
-            angular_speed = FollowConfig::KP_ANGLE * angle_error 
-                          + FollowConfig::KD_ANGLE * angle_deriv;
+        if (distance_diff > 0) {
+            // 距离大于最小距离，启动径向运动
             
-            // 限幅
-            angular_speed = clamp(angular_speed, 
-                                 -FollowConfig::MAX_ANGULAR_SPEED, 
-                                  FollowConfig::MAX_ANGULAR_SPEED);
+            // 计算二次函数系数
+            double radial_coeff = FollowConfig::RADIAL_COEFF_A * distance_diff * distance_diff
+                                + FollowConfig::RADIAL_COEFF_B * distance_diff
+                                + FollowConfig::RADIAL_COEFF_C;
             
-            // 添加死区
-            if (std::abs(angular_speed) < FollowConfig::MIN_ANGULAR_SPEED) {
-                angular_speed = 0.0;
+            // 机器狗的径向速度 = 人的径向速度 × 系数
+            // 单位转换: cm/s -> m/s
+            double radial_speed = (human_radial_speed * radial_coeff) / 100.0;
+            
+            // 如果人在远离机器狗，也要加上距离差带来的基础速度
+            // 这样即使人静止，机器狗也会慢慢靠近
+            radial_speed += (distance_diff / 1000.0);  // 每100cm差距增加0.1m/s
+            
+            // 检查是否超过最大速度
+            if (radial_speed > FollowConfig::MAX_LINEAR_SPEED) {
+                radial_speed = FollowConfig::MAX_LINEAR_SPEED;
+                radial_at_max_speed_ = true;
+            } else if (radial_at_max_speed_) {
+                // 之前在最大速度，检查是否应该减速
+                if (now_distance < FollowConfig::DISTANCE_DECEL_FACTOR * FollowConfig::MIN_DISTANCE) {
+                    radial_at_max_speed_ = false;
+                } else {
+                    // 保持最大速度
+                    radial_speed = FollowConfig::MAX_LINEAR_SPEED;
+                }
+            }
+            
+            x_speed = radial_speed;
+        } else {
+            // 距离小于最小距离，不需要前进（可能需要后退）
+            radial_at_max_speed_ = false;
+            
+            // 如果太近，可以考虑后退
+            if (now_distance < FollowConfig::MIN_DISTANCE * 0.8) {
+                x_speed = -0.1;  // 缓慢后退
             }
         }
-        prev_angle_error_ = angle_error;
         
-        // ============== 距离控制（前进/后退） ==============
+        // ============== 角向运动控制 ==============
         
-        // 如果距离偏差超过容差，则移动
-        if (std::abs(distance_error) > FollowConfig::DISTANCE_TOLERANCE) {
-            // PD控制计算线速度
-            double distance_deriv = distance_error - prev_distance_error_;
-            double forward_speed = FollowConfig::KP_DISTANCE * distance_error 
-                                 + FollowConfig::KD_DISTANCE * distance_deriv;
+        double angle_diff = now_angle - FollowConfig::MIN_ANGLE;
+        
+        if (angle_diff > 0) {
+            // 角度大于最小角度，启动角向运动
             
-            // 限幅
-            forward_speed = clamp(forward_speed, 
-                                 -FollowConfig::MAX_LINEAR_SPEED, 
-                                  FollowConfig::MAX_LINEAR_SPEED);
+            // 计算二次函数系数
+            double angular_coeff = FollowConfig::ANGULAR_COEFF_A * angle_diff * angle_diff
+                                 + FollowConfig::ANGULAR_COEFF_B * angle_diff
+                                 + FollowConfig::ANGULAR_COEFF_C;
             
-            // 添加死区
-            if (std::abs(forward_speed) < FollowConfig::MIN_LINEAR_SPEED) {
-                forward_speed = 0.0;
+            // 机器狗的角速度 = 人的角速度 × 系数
+            // 加上基础的角度偏差纠正
+            double angular_speed_cmd = human_angular_speed * angular_coeff;
+            
+            // 加上基础的角度纠正速度
+            angular_speed_cmd += (angle_diff / 30.0);  // 每30度增加1 rad/s
+            
+            // 转换为rad/s并应用方向
+            angular_speed_cmd = angular_speed_cmd / 57.3;  // 度/秒 转 rad/s
+            angular_speed_cmd *= angle_sign;  // 应用旋转方向
+            
+            // 检查是否超过最大角速度
+            if (std::abs(angular_speed_cmd) > FollowConfig::MAX_ANGULAR_SPEED) {
+                angular_speed_cmd = FollowConfig::MAX_ANGULAR_SPEED * angle_sign;
+                angular_at_max_speed_ = true;
+            } else if (angular_at_max_speed_) {
+                // 之前在最大角速度，检查是否应该减速
+                if (now_angle < FollowConfig::ANGLE_DECEL_FACTOR * FollowConfig::MIN_ANGLE) {
+                    angular_at_max_speed_ = false;
+                } else {
+                    // 保持最大角速度
+                    angular_speed_cmd = FollowConfig::MAX_ANGULAR_SPEED * angle_sign;
+                }
             }
             
-            // 如果角度偏差较大，减小前进速度（先转向再前进）
-            if (std::abs(angle_error) > 30.0) {
-                forward_speed *= 0.3;  // 角度偏差大时，大幅减速
-            } else if (std::abs(angle_error) > 15.0) {
-                forward_speed *= 0.6;  // 角度偏差中等时，适度减速
-            }
-            
-            // 将前进速度分解为X和Y分量
-            // 这里假设机器狗始终面向前方（Y正方向）
-            // X速度用于侧移（根据人的位置进行横向调整）
-            // Y速度用于前进/后退
-            
-            // 计算人相对于机器狗的位置（cm转换为m）
-            double person_x_m = uwb_data.x / 100.0;  // 左右位置 (m)
-            double person_y_m = uwb_data.y / 100.0;  // 前后位置 (m)
-            
-            // Y方向速度：向人所在的方向移动
-            x_speed = forward_speed;
-            
-            // 如果人在侧面，可以添加侧移以更快接近
-            // 侧移速度与人的横向位置成正比
-            double lateral_factor = 0.002;  // 侧移比例系数
-            y_speed = -lateral_factor * person_x_m;  // 向人的方向侧移
-            y_speed = clamp(y_speed, -0.3, 0.3);  // 限制侧移速度
+            angular_speed = angular_speed_cmd;
+        } else {
+            // 角度小于最小角度，不需要旋转
+            angular_at_max_speed_ = false;
         }
-        prev_distance_error_ = distance_error;
+        
+        // ============== 侧向运动（可选） ==============
+        
+        // 如果人在侧面，可以添加侧移以更快接近
+        // y_speed 可以用于侧向移动
+        double lateral_factor = 0.001;  // 侧移比例系数
+        y_speed = -lateral_factor * uwb_data.x;  // 向人的方向侧移
+        y_speed = clamp(y_speed, -0.2, 0.2);  // 限制侧移速度
         
         return true;
     }
@@ -301,10 +357,10 @@ public:
      * 重置控制器状态
      */
     void reset() {
-        prev_distance_error_ = 0.0;
-        prev_angle_error_ = 0.0;
         lost_frame_count_ = 0;
         is_following_ = false;
+        radial_at_max_speed_ = false;
+        angular_at_max_speed_ = false;
     }
     
     /**
@@ -324,10 +380,10 @@ private:
         return value;
     }
     
-    double prev_distance_error_;
-    double prev_angle_error_;
     int lost_frame_count_;
     bool is_following_;
+    bool radial_at_max_speed_;    // 径向是否在最大速度
+    bool angular_at_max_speed_;   // 角向是否在最大角速度
 };
 
 // ============================================================================
@@ -343,12 +399,16 @@ int main(int argc, char* argv[]) {
         std::cout << "\n用法: " << argv[0] << " <串口设备>" << std::endl;
         std::cout << "\n示例:" << std::endl;
         std::cout << "  " << argv[0] << " /dev/ttyUSB0" << std::endl;
+        std::cout << "\n控制逻辑:" << std::endl;
+        std::cout << "  - 径向运动: 速度 = 人的径向速度 × f(distance_diff)" << std::endl;
+        std::cout << "  - 角向运动: 角速度 = 人的角速度 × f(angle_diff)" << std::endl;
+        std::cout << "  - f(x) = a*x² + b*x + c (二次函数)" << std::endl;
         std::cout << "\n参数说明:" << std::endl;
-        std::cout << "  目标跟随距离: " << FollowConfig::TARGET_DISTANCE << " cm (2.5米)" << std::endl;
-        std::cout << "  距离容差: ±" << FollowConfig::DISTANCE_TOLERANCE << " cm" << std::endl;
-        std::cout << "  角度容差: ±" << FollowConfig::ANGLE_TOLERANCE << "°" << std::endl;
+        std::cout << "  最小启动距离: " << FollowConfig::MIN_DISTANCE << " cm (2.5米)" << std::endl;
+        std::cout << "  最小启动角度: " << FollowConfig::MIN_ANGLE << "°" << std::endl;
         std::cout << "  最大线速度: " << FollowConfig::MAX_LINEAR_SPEED << " m/s" << std::endl;
         std::cout << "  最大角速度: " << FollowConfig::MAX_ANGULAR_SPEED << " rad/s" << std::endl;
+        std::cout << "  减速距离: " << FollowConfig::DISTANCE_DECEL_FACTOR << " × 最小距离" << std::endl;
         return 1;
     }
     
@@ -362,7 +422,8 @@ int main(int argc, char* argv[]) {
     std::cout << "UWB机器狗跟随程序 启动" << std::endl;
     std::cout << "============================================" << std::endl;
     std::cout << "串口设备: " << port << std::endl;
-    std::cout << "目标距离: " << FollowConfig::TARGET_DISTANCE << " cm" << std::endl;
+    std::cout << "最小启动距离: " << FollowConfig::MIN_DISTANCE << " cm" << std::endl;
+    std::cout << "控制逻辑: 速度 = 人的速度 × 二次函数系数" << std::endl;
     std::cout << "按 Ctrl+C 退出" << std::endl;
     std::cout << "============================================\n" << std::endl;
     
