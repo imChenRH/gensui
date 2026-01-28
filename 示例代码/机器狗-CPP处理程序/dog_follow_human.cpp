@@ -218,10 +218,10 @@ public:
         
         // 计算人的径向速度（沿着机器狗到人的方向）
         double human_radial_speed = 0.0;
-        if(human_vx>0) {
+        if(human_vy>0) {//前进运动使用实际速度
             human_radial_speed = std::sqrt(human_vx * human_vx + human_vy * human_vy);
         }
-        else {
+        else {//后退或静止运动使用标准速度
             human_radial_speed = FollowConfig::HUMAN_STANDARD_SPEED * 100;  // 转换为cm/s
         }
         
@@ -232,9 +232,9 @@ public:
             // 角速度近似 = (垂直于径向的速度分量) / 距离
             // 假设x是左右方向，y是前后方向
             // 角速度 = vx / distance (简化计算)
-            if((human_vx>0)^(angle_diff>0))
+            if((human_vx>0)^(angle_sign>0))//靠近运动使用标准角速度
                 human_angular_speed = FollowConfig::HUMAN_ANGULAR_SPEED * 57.3;  // 转换为度/秒
-            else
+            else//远离运动使用实际角速度
                 human_angular_speed = std::abs(human_vx) / now_distance * 57.3;  // 转换为度/秒
         }
         
@@ -307,7 +307,7 @@ public:
             x_speed = radial_speed;
         } else {
             // 距离小于最小距离，不需要前进（可能需要后退）
-            // radial_at_max_speed_ = false;
+            radial_at_max_speed_ = false;
             
             // 如果太近，可以考虑后退
             // if (now_distance < FollowConfig::MIN_DISTANCE * 0.8) {
@@ -341,7 +341,7 @@ public:
                 angular_at_max_speed_ = true;
             } else if (angular_at_max_speed_) {
                 // 之前在最大角速度，检查是否应该减速
-                if (angle_diff < FollowConfig::MIN_ANGLE * FollowConfig::ANGLE_DECEL_FACTOR) {
+                if (angle_diff < FollowConfig::ANGLE_DECEL_FACTOR * FollowConfig::MIN_ANGLE) {
                     angular_at_max_speed_ = false;
                 } else {
                     // 保持最大角速度
