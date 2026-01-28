@@ -46,24 +46,27 @@ namespace FollowConfig {
     constexpr double DISTANCE_DECEL_FACTOR = 1.1;  // 减速距离系数，当距离<1.1*MIN_DISTANCE时从最大速度减速
     
     // 角度参数
-    constexpr double MIN_ANGLE = 5.0;              // 最小启动角度 (度)，低于此角度不启动角向运动
-    constexpr double ANGLE_DECEL_FACTOR = 1.1;     // 减速角度系数
+    constexpr double MIN_ANGLE = 3.5;              // 最小启动角度 (度)，低于此角度不启动角向运动
+    constexpr double TARGET_ANGLE = 90.0;          // 目标角度 (度)
+    constexpr double ANGLE_DECEL_FACTOR = 1.1;     // 角度减速系数，当角度<1.1*MIN_ANGLE时从最大角速度减速
     
     // 速度限制
-    constexpr double MAX_LINEAR_SPEED = 0.8;       // 最大线速度 (m/s)
-    constexpr double MAX_ANGULAR_SPEED = 1.2;      // 最大角速度 (rad/s)
+    constexpr double MAX_LINEAR_SPEED = 5.0;       // 最大线速度 (m/s)
+    constexpr double MAX_ANGULAR_SPEED = 1.0;      // 最大角速度 (rad/s)
     
+    //人标准速度
+    constexpr double HUMAN_STANDARD_SPEED = 1.2;   // 人的标准行走速度 (m/s)
+    constexpr double HUMAN_ANGULAR_SPEED = 0.4;    // 人的标准角速度 (rad/s)
+
     // 二次函数系数 - 用于计算跟随系数
-    // 系数 = a * (distance_diff)^2 + b * (distance_diff) + c
-    // 当 distance_diff = 0 时，系数 = 0
     // 当 distance_diff 增大时，系数增大
-    constexpr double RADIAL_COEFF_A = 0.00001;     // 径向二次系数
-    constexpr double RADIAL_COEFF_B = 0.005;       // 径向一次系数
-    constexpr double RADIAL_COEFF_C = 0.0;         // 径向常数项
+    constexpr double RADIAL_COEFF_A = 0.0001;      // 径向二次系数
+    constexpr double RADIAL_COEFF_B = 0.02;        // 径向一次系数
+    constexpr double RADIAL_COEFF_C = 1.0;         // 径向常数项
     
-    constexpr double ANGULAR_COEFF_A = 0.001;      // 角向二次系数
-    constexpr double ANGULAR_COEFF_B = 0.05;       // 角向一次系数
-    constexpr double ANGULAR_COEFF_C = 0.0;        // 角向常数项
+    constexpr double ANGULAR_COEFF_A = 0.0001;     // 角向二次系数
+    constexpr double ANGULAR_COEFF_B = 0.04;       // 角向一次系数
+    constexpr double ANGULAR_COEFF_C = 1.0;        // 角向常数项
     
     // 安全参数
     constexpr double STOP_DISTANCE = 100.0;        // 停止距离 (cm)，人太近时停止
@@ -200,15 +203,27 @@ public:
         
         // 获取当前距离和角度
         double now_distance = uwb_data.distance_cm;
-        double now_angle = std::abs(uwb_data.azimuth_deg);  // 角度偏差的绝对值
-        double angle_sign = (uwb_data.azimuth_deg >= 0) ? 1.0 : -1.0;  // 角度方向
+        double now_angle = uwb_data.azimuth_deg;
         
+        // 计算距离和角度差
+        double distance_diff = now_distance - FollowConfig::MIN_DISTANCE;
+        
+        double angle_diff = now_angle - FollowConfig::TARGET_ANGLE;
+        double angle_sign = (angle_diff >= 0) ? 1.0 : -1.0;  // 角度方向
+        angle_diff = std::abs(angle_diff);
+
         // 获取EKF估计的人的速度
         double human_vx = uwb_data.vx;  // X方向速度 (cm/s)
         double human_vy = uwb_data.vy;  // Y方向速度 (cm/s)
         
         // 计算人的径向速度（沿着机器狗到人的方向）
-        double human_radial_speed = std::sqrt(human_vx * human_vx + human_vy * human_vy);
+        double human_radial_speed = 0.0;
+        if(human_vx>0) {
+            human_radial_speed = std::sqrt(human_vx * human_vx + human_vy * human_vy);
+        }
+        else {
+            human_radial_speed = FollowConfig::HUMAN_STANDARD_SPEED * 100;  // 转换为cm/s
+        }
         
         // 计算人的角向速度（需要从xy速度分解）
         // 使用arctan2计算人移动方向的角度变化率
@@ -217,7 +232,10 @@ public:
             // 角速度近似 = (垂直于径向的速度分量) / 距离
             // 假设x是左右方向，y是前后方向
             // 角速度 = vx / distance (简化计算)
-            human_angular_speed = std::abs(human_vx) / now_distance * 57.3;  // 转换为度/秒
+            if((human_vx>0)^(angle_diff>0))
+                human_angular_speed = FollowConfig::HUMAN_ANGULAR_SPEED * 57.3;  // 转换为度/秒
+            else
+                human_angular_speed = std::abs(human_vx) / now_distance * 57.3;  // 转换为度/秒
         }
         
         // ============== 安全检查 ==============
@@ -255,9 +273,7 @@ public:
         }
         
         // ============== 径向运动控制 ==============
-        
-        double distance_diff = now_distance - FollowConfig::MIN_DISTANCE;
-        
+                
         if (distance_diff > 0) {
             // 距离大于最小距离，启动径向运动
             
@@ -272,7 +288,7 @@ public:
             
             // 如果人在远离机器狗，也要加上距离差带来的基础速度
             // 这样即使人静止，机器狗也会慢慢靠近
-            radial_speed += (distance_diff / 1000.0);  // 每100cm差距增加0.1m/s
+            // radial_speed += (distance_diff / 1000.0);  // 每100cm差距增加0.1m/s
             
             // 检查是否超过最大速度
             if (radial_speed > FollowConfig::MAX_LINEAR_SPEED) {
@@ -291,19 +307,17 @@ public:
             x_speed = radial_speed;
         } else {
             // 距离小于最小距离，不需要前进（可能需要后退）
-            radial_at_max_speed_ = false;
+            // radial_at_max_speed_ = false;
             
             // 如果太近，可以考虑后退
-            if (now_distance < FollowConfig::MIN_DISTANCE * 0.8) {
-                x_speed = -0.1;  // 缓慢后退
-            }
+            // if (now_distance < FollowConfig::MIN_DISTANCE * 0.8) {
+            // x_speed = -0.1;  // 缓慢后退
+            // }
         }
         
         // ============== 角向运动控制 ==============
-        
-        double angle_diff = now_angle - FollowConfig::MIN_ANGLE;
-        
-        if (angle_diff > 0) {
+
+        if (angle_diff > FollowConfig::MIN_ANGLE) {
             // 角度大于最小角度，启动角向运动
             
             // 计算二次函数系数
@@ -316,27 +330,26 @@ public:
             double angular_speed_cmd = human_angular_speed * angular_coeff;
             
             // 加上基础的角度纠正速度
-            angular_speed_cmd += (angle_diff / 30.0);  // 每30度增加1 rad/s
+            // angular_speed_cmd += (angle_diff / 30.0);  // 每30度增加1 rad/s
             
             // 转换为rad/s并应用方向
             angular_speed_cmd = angular_speed_cmd / 57.3;  // 度/秒 转 rad/s
-            angular_speed_cmd *= angle_sign;  // 应用旋转方向
             
             // 检查是否超过最大角速度
-            if (std::abs(angular_speed_cmd) > FollowConfig::MAX_ANGULAR_SPEED) {
-                angular_speed_cmd = FollowConfig::MAX_ANGULAR_SPEED * angle_sign;
+            if (angular_speed_cmd > FollowConfig::MAX_ANGULAR_SPEED) {
+                angular_speed_cmd = FollowConfig::MAX_ANGULAR_SPEED;
                 angular_at_max_speed_ = true;
             } else if (angular_at_max_speed_) {
                 // 之前在最大角速度，检查是否应该减速
-                if (now_angle < FollowConfig::ANGLE_DECEL_FACTOR * FollowConfig::MIN_ANGLE) {
+                if (angle_diff < FollowConfig::MIN_ANGLE * FollowConfig::ANGLE_DECEL_FACTOR) {
                     angular_at_max_speed_ = false;
                 } else {
                     // 保持最大角速度
-                    angular_speed_cmd = FollowConfig::MAX_ANGULAR_SPEED * angle_sign;
+                    angular_speed_cmd = FollowConfig::MAX_ANGULAR_SPEED;
                 }
             }
             
-            angular_speed = angular_speed_cmd;
+            angular_speed = angular_speed_cmd * angle_sign;
         } else {
             // 角度小于最小角度，不需要旋转
             angular_at_max_speed_ = false;
@@ -346,9 +359,9 @@ public:
         
         // 如果人在侧面，可以添加侧移以更快接近
         // y_speed 可以用于侧向移动
-        double lateral_factor = 0.001;  // 侧移比例系数
-        y_speed = -lateral_factor * uwb_data.x;  // 向人的方向侧移
-        y_speed = clamp(y_speed, -0.2, 0.2);  // 限制侧移速度
+        // double lateral_factor = 0.001;  // 侧移比例系数
+        // y_speed = -lateral_factor * uwb_data.x;  // 向人的方向侧移
+        // y_speed = clamp(y_speed, -0.2, 0.2);  // 限制侧移速度
         
         return true;
     }
