@@ -4,9 +4,7 @@
 
 本程序用于机器狗接收UWB基站数据，进行数据滤波处理，实现跟随人的功能。
 
-**提供两种封装方式：**
-1. **DogController（整合版）** - 直接返回机器狗速度指令，一行代码搞定！
-2. **UWBFollower** - 返回位置数据，自己实现跟随逻辑
+**🎉 单头文件版本：只需 `#include "dog_controller_full.h"` 即可使用！**
 
 参考资料：
 - STM32F1-Usart文件夹（数据帧解析）
@@ -16,20 +14,19 @@
 
 | 文件 | 说明 |
 |------|------|
-| **dog_controller.h** | **整合库头文件** - 直接返回速度指令 |
-| **dog_controller.cpp** | **整合库实现** - 包含UWB+跟随控制 |
-| `uwb_follower.h` | UWB数据库头文件 |
-| `uwb_follower.cpp` | UWB数据库实现 |
+| **dog_controller_full.h** | **单头文件版本** - 只需要这一个头文件！ |
+| **dog_controller_full.cpp** | **单头文件版本实现** - 编译时链接 |
 | **simple_example.cpp** | **简单示例** - 展示如何使用 |
-| `dog_follow_human.cpp` | 完整跟随程序 |
-| `example_usage.cpp` | 旧版示例代码 |
+| `dog_follow_human.cpp` | 完整跟随程序（旧版） |
+| `dog_controller.h/cpp` | 旧版整合库（需要uwb_follower） |
+| `uwb_follower.h/cpp` | 旧版UWB数据库 |
 
-## 🚀 快速使用（整合版 - 推荐！）
+## 🚀 快速使用（单头文件版 - 推荐！）
 
-**一行代码获取机器狗速度指令！**
+**一行代码获取机器狗速度指令，只需include一个头文件！**
 
 ```cpp
-#include "dog_controller.h"
+#include "dog_controller_full.h"  // 只需要这一个！
 
 int main() {
     DogController dog;
@@ -64,7 +61,19 @@ int main() {
 }
 ```
 
-### DogVelocity 结构体
+## 编译方法
+
+### 单头文件版（推荐）
+```bash
+g++ simple_example.cpp dog_controller_full.cpp -o simple_example -std=c++11 -lm
+```
+
+### 交叉编译（ARM平台）
+```bash
+arm-linux-gnueabihf-g++ simple_example.cpp dog_controller_full.cpp -o simple_example -std=c++11 -lm
+```
+
+## DogVelocity 结构体
 
 ```cpp
 struct DogVelocity {
@@ -77,34 +86,9 @@ struct DogVelocity {
     // 调试信息
     double distance_cm;  // 当前距离
     double azimuth_deg;  // 当前角度
+    double human_vx;     // 人的X速度
+    double human_vy;     // 人的Y速度
 };
-```
-
-## 方式二：使用UWBFollower（仅获取位置）
-
-```cpp
-#include "uwb_follower.h"
-
-int main() {
-    UWBFollower follower;
-    follower.init("/dev/ttyUSB0");
-    
-    while (true) {
-        UWB2DData data = follower.getData();
-        
-        if (data.is_valid) {
-            // 自己实现跟随控制逻辑
-            double x = data.x;      // X坐标 (cm)
-            double y = data.y;      // Y坐标 (cm)
-            double vx = data.vx;    // X速度 (cm/s)
-            double vy = data.vy;    // Y速度 (cm/s)
-            
-            // your_control_logic(x, y, vx, vy);
-        }
-    }
-    
-    return 0;
-}
 ```
 
 ## 功能特点
@@ -125,219 +109,76 @@ Y = Distance × cos(Azimuth)
 | Step 3 | 中位数滤波 | 窗口大小5，消除尖峰异常值 |
 | Step 4 | EKF状态估计 | 2D位置平滑 + 速度估计 |
 
-### 角度突变抑制原理
-```
-规则：
-- 当 αk - αk-1 > 10°:  αexport = αk-1, dexport = dk-1 + 2
-- 当 αk - αk-1 < -10°: αexport = αk-1, dexport = dk-1 - 2
-- 当 |αk - αk-1| ≤ 10°: αexport = αk, dexport = dk
-```
+### 跟随控制逻辑
 
-## 编译方法
+- 径向运动：基于EKF估计的人的速度 × 二次函数系数
+- 角向运动：同样的逻辑应用于角度控制
+- 速度平滑：指数移动平均(EMA)
+- 安全保护：太近停止、太远丢失检测
 
-### 方式一：使用整合库（推荐）
-```bash
-g++ simple_example.cpp dog_controller.cpp uwb_follower.cpp -o simple_example -std=c++11 -lm
-```
+## 配置参数
 
-### 方式二：使用UWB库
-```bash
-g++ -c uwb_follower.cpp -o uwb_follower.o -std=c++11
-g++ your_main.cpp uwb_follower.o -o your_program -std=c++11 -lm
-```
+可在 `FollowConfig` 命名空间中调整：
 
-### 方式三：编译完整跟随程序
-```bash
-g++ dog_follow_human.cpp uwb_follower.cpp -o dog_follow_human -std=c++11 -lm
-```
-
-### 交叉编译（ARM平台）
-```bash
-arm-linux-gnueabihf-g++ simple_example.cpp dog_controller.cpp uwb_follower.cpp -o simple_example -std=c++11 -lm
+```cpp
+namespace FollowConfig {
+    // 跟随距离
+    constexpr double MIN_DISTANCE = 250.0;     // 2.5米
+    
+    // 速度限制
+    constexpr double MAX_LINEAR_SPEED = 5.0;   // m/s
+    constexpr double MAX_ANGULAR_SPEED = 1.0;  // rad/s
+    
+    // 安全参数
+    constexpr double STOP_DISTANCE = 100.0;    // 太近停止
+    constexpr double LOST_DISTANCE = 1000.0;   // 太远丢失
+}
 ```
 
 ## 使用方法
 
 ```bash
-./uwb_dog_follower /dev/ttyUSB0
+./simple_example /dev/ttyUSB0
 ```
 
 ## 输出示例
 
 ```
 ============================================
-  UWB机器狗跟随程序 - 数据处理模块
+UWB机器狗跟随库 - 简单示例
+============================================
+串口 /dev/ttyUSB0 初始化成功 (波特率=115200)
+串口已连接: /dev/ttyUSB0
+按 Ctrl+C 退出
 ============================================
 
-滤波流程：
-  1. 物理约束检查 (距离:5-5000cm, 速度<300cm/s)
-  2. 角度突变抑制 (阈值:10°)
-  3. 中位数滤波 (窗口:5)
-  4. EKF状态估计
-
-✓ 串口 /dev/ttyUSB0 已打开
-  波特率: 115200
-
-开始接收数据...
-按 Ctrl+C 退出
-
-【滤波后数据】 X=25.9cm, Y=96.7cm | Vx=0.0, Vy=0.0cm/s | 距离=100cm, 角度=15°
-【滤波后数据】 X=27.1cm, Y=99.2cm | Vx=1.2, Vy=2.5cm/s | 距离=103cm, 角度=15°
-...
+距离=320cm 角度=15.0° | 速度: vx=0.35 vy=0.00 omega=0.45 | 跟随中
+距离=280cm 角度=8.2° | 速度: vx=0.15 vy=0.00 omega=0.25 | 跟随中
+距离=252cm 角度=2.1° | 速度: vx=0.00 vy=0.00 omega=0.00 | 跟随中
 ```
 
-## 数据结构
+## 如何集成到您的机器狗SDK
 
-### 输出数据 (UWB2DData)
 ```cpp
-struct UWB2DData {
-    double x;           // X坐标 (cm)
-    double y;           // Y坐标 (cm)
-    double vx;          // X方向速度 (cm/s)
-    double vy;          // Y方向速度 (cm/s)
-    double distance_cm; // 距离 (cm)
-    double azimuth_deg; // 方位角 (度)
-    bool is_valid;      // 数据有效标志
-};
-```
+#include "dog_controller_full.h"
 
-## 如何集成到机器狗控制程序
+// 创建您的机器狗对象
+YourRobotSDK robot;
 
-### 方式一：使用封装库（推荐）
-```cpp
-#include "uwb_follower.h"
-
-UWBFollower follower;
-follower.init("/dev/ttyUSB0");
+// 创建UWB控制器
+DogController dog;
+dog.init("/dev/ttyUSB0");
 
 while (running) {
-    UWB2DData data = follower.getData();
-    if (data.is_valid) {
-        // 跟随逻辑
-        double distance = sqrt(data.x * data.x + data.y * data.y);
-        double error = distance - TARGET_DISTANCE;
-        
-        if (fabs(error) > DEAD_ZONE) {
-            robot_move(data.x, data.y);
-        }
+    DogVelocity vel = dog.getVelocity();
+    
+    if (vel.is_valid) {
+        // 将速度指令发送给机器狗
+        robot.setVelocity(vel.vx, vel.vy, vel.omega);
     }
 }
 ```
 
-### 方式二：只使用数据处理器
-```cpp
-#include "uwb_follower.h"
-
-UWBDataProcessor processor;
-
-// 当收到UWB原始数据时
-UWBRawData raw;
-raw.distance_cm = 100;
-raw.azimuth_deg = 15;
-raw.is_valid = true;
-
-UWB2DData result = processor.process(raw);
-
-if (result.is_valid) {
-    robot_follow(result.x, result.y, result.vx, result.vy);
-}
-```
-
-### 方式三：使用独立版程序
-直接运行 `uwb_dog_follower`，读取输出结果。
-
-## 配置参数
-
-在代码开头可以调整以下参数：
-
-```cpp
-// 物理约束参数
-const double MIN_DISTANCE = 5.0;       // 最小距离 (cm)
-const double MAX_DISTANCE = 5000.0;    // 最大距离 (cm)
-const double MAX_VELOCITY = 300.0;     // 最大速度 (cm/s)
-
-// 中位数滤波参数
-const int MEDIAN_WINDOW_SIZE = 5;      // 窗口大小
-
-// 角度突变抑制参数
-const double ANGLE_THRESHOLD = 10.0;   // 阈值（度）
-
-// EKF参数
-const double EKF_PROCESS_NOISE = 0.5;      // 过程噪声
-const double EKF_MEASUREMENT_NOISE = 1.0;  // 测量噪声
-```
-
 ## 作者
 
-Copilot @ 2026-01-27
-
----
-
-## 🎯 跟随控制程序 (dog_follow_human.cpp)
-
-### 功能
-
-实现机器狗以约**2.5米**距离跟随人，并始终朝向人。
-
-### 控制逻辑
-
-1. **获取UWB位置** - 使用`UWBFollower`库获取人的位置(x, y)
-2. **距离控制** - 保持与目标人2.5米（250cm）的距离
-3. **角度控制** - 始终转向面对目标人
-4. **速度输出** - 通过`dog.move(x_speed, y_speed, angular_speed)`控制
-
-### 控制参数
-
-```cpp
-// 跟随距离
-TARGET_DISTANCE = 250.0 cm     // 目标距离：2.5米
-DISTANCE_TOLERANCE = 30.0 cm   // 距离容差
-
-// 速度限制
-MAX_LINEAR_SPEED = 0.8 m/s     // 最大线速度
-MAX_ANGULAR_SPEED = 1.2 rad/s  // 最大角速度
-
-// 安全参数
-STOP_DISTANCE = 100.0 cm       // 太近时停止
-LOST_DISTANCE = 1000.0 cm      // 太远时停止跟随
-```
-
-### 编译运行
-
-```bash
-# 编译
-g++ dog_follow_human.cpp uwb_follower.cpp -o dog_follow_human -std=c++11 -lm
-
-# 运行
-./dog_follow_human /dev/ttyUSB0
-```
-
-### 输出示例
-
-```
-============================================
-UWB机器狗跟随程序 启动
-============================================
-串口设备: /dev/ttyUSB0
-目标距离: 250 cm
-按 Ctrl+C 退出
-============================================
-
-[信息] UWB串口已连接
-[机器狗] 初始化完成
-[信息] 开始跟随控制循环...
-[跟随] 检测到目标，开始跟随 (距离=320cm, 角度=15°)
-[状态] 距离=320cm 角度=15.0° | 速度: X=0.35 Y=0.00 W=0.45 | 跟随中
-[状态] 距离=280cm 角度=8.2° | 速度: X=0.15 Y=0.00 W=0.25 | 跟随中
-[状态] 距离=252cm 角度=2.1° | 速度: X=0.00 Y=0.00 W=0.00 | 跟随中
-```
-
-### 如何集成到您的机器狗SDK
-
-在`dog_follow_human.cpp`中找到`RobotDog`类，将`move()`函数替换为您的机器狗SDK：
-
-```cpp
-void move(double x_speed, double y_speed, double angular_speed) {
-    // TODO: 替换为您的机器狗SDK
-    // 例如：your_robot_sdk.setVelocity(x_speed, y_speed, angular_speed);
-}
+Copilot @ 2026-01-29

@@ -5,8 +5,8 @@
  * 
  * 展示如何使用 DogController 库获取机器狗的速度指令
  * 
- * 编译命令：
- *     g++ simple_example.cpp dog_controller.cpp uwb_follower.cpp -o simple_example -std=c++11 -lm
+ * 编译命令（单头文件版本，无需其他依赖）：
+ *     g++ simple_example.cpp dog_controller_full.cpp -o simple_example -std=c++11 -lm
  * 
  * 运行命令：
  *     ./simple_example /dev/ttyUSB0
@@ -14,10 +14,9 @@
  * ============================================================================
  */
 
-#include <iostream>
 #include <csignal>
 #include <unistd.h>
-#include "dog_controller.h"
+#include "dog_controller_full.h"  // 只需要这一个头文件！
 
 volatile bool g_running = true;
 
