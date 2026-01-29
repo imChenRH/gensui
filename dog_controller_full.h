@@ -1,10 +1,4 @@
 /**
- * ============================================================================
- * UWB单基站跟随套件 - 机器狗跟随控制完整库（单头文件版）
- * ============================================================================
- * 
- * 文件名：dog_controller_full.h
- * 
  * 功能说明：
  *     整合 UWB数据接收、协议解析、滤波处理 和 跟随控制 的一体化库
  *     只需包含此头文件和对应的cpp文件，即可获取机器狗的控制速度
@@ -25,8 +19,6 @@
  * 
  * 编译方法：
  *     g++ your_main.cpp dog_controller_full.cpp -o your_program -std=c++11 -lm
- * 
- * ============================================================================
  */
 
 #ifndef DOG_CONTROLLER_FULL_H
@@ -49,9 +41,9 @@ namespace UWBConfig {
     // 物理约束参数
     constexpr double MIN_DISTANCE = 5.0;       // 最小距离 (cm)
     constexpr double MAX_DISTANCE = 5000.0;    // 最大距离 (cm)
-    constexpr double MAX_VELOCITY = 300.0;     // 最大速度 (cm/s)
-    constexpr double MIN_AZIMUTH = -180.0;     // 最小方位角 (度)
-    constexpr double MAX_AZIMUTH = 180.0;      // 最大方位角 (度)
+    constexpr double MAX_VELOCITY = 600.0;     // 最大速度 (cm/s)
+    constexpr double MIN_AZIMUTH = 20.0;       // 最小方位角 (度)
+    constexpr double MAX_AZIMUTH = 160.0;      // 最大方位角 (度)
     
     // 中位数滤波参数
     constexpr int MEDIAN_WINDOW_SIZE = 5;      // 中位数滤波窗口大小
@@ -78,9 +70,9 @@ namespace FollowConfig {
     constexpr double DISTANCE_DECEL_FACTOR = 1.8;  // 减速距离系数
     
     // 角度参数
-    constexpr double MIN_ANGLE = 3.5;              // 最小启动角度 (度)
+    constexpr double MIN_ANGLE = 1.0;              // 最小启动角度 (度)
     constexpr double TARGET_ANGLE = 90.0;          // 目标角度 (度)
-    constexpr double ANGLE_DECEL_FACTOR = 1.1;     // 角度减速系数
+    constexpr double ANGLE_DECEL_FACTOR = 2.0;     // 角度减速系数
     
     // 速度限制
     constexpr double MAX_LINEAR_SPEED = 5.0;       // 最大线速度 (m/s)
@@ -103,8 +95,8 @@ namespace FollowConfig {
     constexpr int MAX_LOST_FRAMES = 30;            // 最大丢失帧数
     
     // 速度平滑参数
-    constexpr double RADIAL_SMOOTH_ALPHA = 0.3;    // 径向速度平滑系数
-    constexpr double ANGULAR_SMOOTH_ALPHA = 0.4;   // 角向速度平滑系数
+    constexpr double RADIAL_SMOOTH_ALPHA = 0.3;    // 径向速度平滑系数 (0.0-1.0)
+    constexpr double ANGULAR_SMOOTH_ALPHA = 0.4;   // 角向速度平滑系数 (0.0-1.0)
 }
 
 // ============================================================================
@@ -290,38 +282,6 @@ private:
     int filtered_count_;
 };
 
-// ============================================================================
-// 主接口类：DogController
-// ============================================================================
-
-/**
- * 机器狗跟随控制器
- * 
- * 整合了：
- * - UWB数据接收（串口通信）
- * - 协议解析（0x2001命令）
- * - 四步滤波处理（物理约束→角度突变抑制→中位数滤波→EKF）
- * - 跟随控制算法
- * 
- * 输出机器狗的速度指令：vx, vy, omega
- * 
- * 使用示例：
- * ```cpp
- * #include "dog_controller_full.h"
- * 
- * DogController dog;
- * if (!dog.init("/dev/ttyUSB0")) {
- *     return -1;
- * }
- * 
- * while (true) {
- *     DogVelocity vel = dog.getVelocity();
- *     if (vel.is_valid) {
- *         your_robot.move(vel.vx, vel.vy, vel.omega);
- *     }
- * }
- * ```
- */
 class DogController {
 public:
     DogController();
