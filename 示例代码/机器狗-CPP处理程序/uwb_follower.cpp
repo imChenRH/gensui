@@ -334,62 +334,82 @@ void PhysicalConstraintChecker::reset() {
 UWBFrameParser::UWBFrameParser() : buffer_index_(0) {}
 
 bool UWBFrameParser::feedByte(uint8_t byte, UWBRawData& out_data) {
+    // 状态机模式：先找帧头，再接收数据
     buffer_[buffer_index_++] = byte;
     
+    // 缓冲区溢出保护
     if (buffer_index_ >= sizeof(buffer_)) {
         buffer_index_ = 0;
         return false;
     }
     
+    // 检查是否有帧头（4个0xFF）
     if (buffer_index_ >= 4) {
-        bool header_found = true;
-        for (int i = 0; i < 4; i++) {
-            if (buffer_[buffer_index_ - 4 + i] != 0xFF) {
-                header_found = false;
-                break;
+        // 如果前4字节不是帧头，丢弃第一个字节并继续
+        if (buffer_[0] != 0xFF || buffer_[1] != 0xFF || 
+            buffer_[2] != 0xFF || buffer_[3] != 0xFF) {
+            // 寻找可能的帧头起始位置
+            int shift = 1;
+            for (int i = 1; i < buffer_index_ - 3; i++) {
+                if (buffer_[i] == 0xFF && buffer_[i+1] == 0xFF && 
+                    buffer_[i+2] == 0xFF && buffer_[i+3] == 0xFF) {
+                    shift = i;
+                    break;
+                }
             }
-        }
-        
-        if (header_found && buffer_index_ == 4) {
-            // 帧头找到
-        } else if (!header_found && buffer_index_ < 6) {
-            if (buffer_index_ > 3) {
-                memmove(buffer_, buffer_ + buffer_index_ - 3, 3);
-                buffer_index_ = 3;
+            if (shift > 0) {
+                memmove(buffer_, buffer_ + shift, buffer_index_ - shift);
+                buffer_index_ -= shift;
             }
         }
     }
     
+    // 检查是否收到完整帧
     if (buffer_index_ >= UWBConfig::FRAME_SIZE) {
+        // 再次确认帧头
         if (buffer_[0] == 0xFF && buffer_[1] == 0xFF && 
             buffer_[2] == 0xFF && buffer_[3] == 0xFF) {
             
+            // 异或校验
             uint8_t xor_check = 0;
             for (int i = 0; i < UWBConfig::FRAME_SIZE - 1; i++) {
                 xor_check ^= buffer_[i];
             }
             
             if (xor_check == buffer_[UWBConfig::FRAME_SIZE - 1]) {
-                uint16_t cmd = (buffer_[8] << 8) | buffer_[9];
+                // 解析命令码 - 大端序直接读取，高字节在前
+                uint16_t cmd = (static_cast<uint16_t>(buffer_[8]) << 8) | 
+                               static_cast<uint16_t>(buffer_[9]);
                 
                 if (cmd == CMD_LOCATION) {
-                    out_data.anchor_id = U32HighLowByteSwap(
-                        (buffer_[12] << 24) | (buffer_[13] << 16) |
-                        (buffer_[14] << 8) | buffer_[15]);
+                    // 大端序数据直接读取，不需要交换字节序
+                    // buffer_[12]是高字节，buffer_[15]是低字节
+                    out_data.anchor_id = 
+                        (static_cast<uint32_t>(buffer_[12]) << 24) | 
+                        (static_cast<uint32_t>(buffer_[13]) << 16) |
+                        (static_cast<uint32_t>(buffer_[14]) << 8) | 
+                        static_cast<uint32_t>(buffer_[15]);
                     
-                    out_data.tag_id = U32HighLowByteSwap(
-                        (buffer_[16] << 24) | (buffer_[17] << 16) |
-                        (buffer_[18] << 8) | buffer_[19]);
+                    out_data.tag_id = 
+                        (static_cast<uint32_t>(buffer_[16]) << 24) | 
+                        (static_cast<uint32_t>(buffer_[17]) << 16) |
+                        (static_cast<uint32_t>(buffer_[18]) << 8) | 
+                        static_cast<uint32_t>(buffer_[19]);
                     
-                    out_data.distance_cm = U32HighLowByteSwap(
-                        (buffer_[20] << 24) | (buffer_[21] << 16) |
-                        (buffer_[22] << 8) | buffer_[23]);
+                    out_data.distance_cm = 
+                        (static_cast<uint32_t>(buffer_[20]) << 24) | 
+                        (static_cast<uint32_t>(buffer_[21]) << 16) |
+                        (static_cast<uint32_t>(buffer_[22]) << 8) | 
+                        static_cast<uint32_t>(buffer_[23]);
                     
+                    // 有符号16位整数
                     out_data.azimuth_deg = static_cast<int16_t>(
-                        U16HighLowByteSwap((buffer_[24] << 8) | buffer_[25]));
+                        (static_cast<uint16_t>(buffer_[24]) << 8) | 
+                        static_cast<uint16_t>(buffer_[25]));
                     
                     out_data.elevation_deg = static_cast<int16_t>(
-                        U16HighLowByteSwap((buffer_[26] << 8) | buffer_[27]));
+                        (static_cast<uint16_t>(buffer_[26]) << 8) | 
+                        static_cast<uint16_t>(buffer_[27]));
                     
                     out_data.is_valid = true;
                     
@@ -399,6 +419,7 @@ bool UWBFrameParser::feedByte(uint8_t byte, UWBRawData& out_data) {
             }
         }
         
+        // 帧无效，丢弃第一个字节继续寻找
         memmove(buffer_, buffer_ + 1, buffer_index_ - 1);
         buffer_index_--;
     }

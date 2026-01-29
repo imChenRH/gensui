@@ -23,7 +23,8 @@
  *     g++ dog_follow_human.cpp uwb_follower.cpp -o dog_follow_human -std=c++11 -lm
  * 
  * 运行命令：
- *     ./dog_follow_human /dev/ttyUSB0
+ *     ./dog_follow_human /dev/ttyUSB0           # 正常模式
+ *     ./dog_follow_human /dev/ttyUSB0 --debug   # 调试模式（显示详细信息）
  * 
  * 作者：Copilot
  * 日期：2026-01-28
@@ -43,7 +44,7 @@
 namespace FollowConfig {
     // 跟随距离参数
     constexpr double MIN_DISTANCE = 250.0;         // 最小跟随距离 (cm) = 2.5米，低于此距离机器狗不启动径向运动
-    constexpr double DISTANCE_DECEL_FACTOR = 1.1;  // 减速距离系数，当距离<1.1*MIN_DISTANCE时从最大速度减速
+    constexpr double DISTANCE_DECEL_FACTOR = 1.8;  // 减速距离系数，当距离<1.1*MIN_DISTANCE时从最大速度减速
     
     // 角度参数
     constexpr double MIN_ANGLE = 3.5;              // 最小启动角度 (度)，低于此角度不启动角向运动
@@ -55,17 +56,15 @@ namespace FollowConfig {
     constexpr double MAX_ANGULAR_SPEED = 1.0;      // 最大角速度 (rad/s)
     
     //人标准速度
-    constexpr double HUMAN_STANDARD_SPEED = 1.2;   // 人的标准行走速度 (m/s)
+    constexpr double HUMAN_STANDARD_SPEED = 1.0;   // 人的标准行走速度 (m/s)
     constexpr double HUMAN_ANGULAR_SPEED = 0.4;    // 人的标准角速度 (rad/s)
 
     // 二次函数系数 - 用于计算跟随系数
     // 当 distance_diff 增大时，系数增大
-    constexpr double RADIAL_COEFF_A = 0.0001;      // 径向二次系数
-    constexpr double RADIAL_COEFF_B = 0.02;        // 径向一次系数
+    constexpr double RADIAL_COEFF_A = 0.000016;    // 径向二次系数
     constexpr double RADIAL_COEFF_C = 1.0;         // 径向常数项
     
-    constexpr double ANGULAR_COEFF_A = 0.0001;     // 角向二次系数
-    constexpr double ANGULAR_COEFF_B = 0.04;       // 角向一次系数
+    constexpr double ANGULAR_COEFF_A = 0.0025;     // 角向二次系数
     constexpr double ANGULAR_COEFF_C = 1.0;        // 角向常数项
     
     // 安全参数
@@ -75,6 +74,11 @@ namespace FollowConfig {
     
     // 控制频率
     constexpr int CONTROL_PERIOD_MS = 50;          // 控制周期 (ms)
+    
+    // 速度平滑参数（指数移动平均）
+    // alpha越小，平滑效果越强，响应越慢；alpha越大，响应越快，平滑效果越弱
+    constexpr double RADIAL_SMOOTH_ALPHA = 0.3;    // 径向速度平滑系数 (0.0-1.0)
+    constexpr double ANGULAR_SMOOTH_ALPHA = 0.4;   // 角向速度平滑系数 (0.0-1.0)
 }
 
 // ============================================================================
@@ -91,59 +95,6 @@ void signalHandler(int signum) {
     std::cout << "\n[信息] 收到退出信号，正在停止..." << std::endl;
     g_running = false;
 }
-
-// ============================================================================
-// 机器狗控制接口（需要根据实际SDK替换）
-// ============================================================================
-
-/**
- * 机器狗控制类
- * 注意：这是一个示例接口，需要根据您的机器狗SDK进行替换
- */
-class RobotDog {
-public:
-    /**
-     * 初始化机器狗
-     * @return true = 初始化成功
-     */
-    bool init() {
-        // TODO: 替换为实际的机器狗SDK初始化代码
-        std::cout << "[机器狗] 初始化完成" << std::endl;
-        return true;
-    }
-    
-    /**
-     * 控制机器狗移动
-     * @param x_speed X方向速度 (m/s)，正值=向前，负值=向后
-     * @param y_speed Y方向速度 (m/s)，正值=向左，负值=向右
-     * @param angular_speed 角速度 (rad/s)，正值=逆时针，负值=顺时针
-     */
-    void move(double x_speed, double y_speed, double angular_speed) {
-        // TODO: 替换为实际的机器狗SDK控制代码
-        // 例如：robot_sdk_move(x_speed, y_speed, angular_speed);
-        
-        // 调试输出（实际使用时可以注释掉）
-        // printf("[机器狗] 速度指令: X=%.3f m/s, Y=%.3f m/s, W=%.3f rad/s\n", 
-        //        x_speed, y_speed, angular_speed);
-    }
-    
-    /**
-     * 停止机器狗
-     */
-    void stop() {
-        move(0.0, 0.0, 0.0);
-        std::cout << "[机器狗] 已停止" << std::endl;
-    }
-    
-    /**
-     * 关闭机器狗连接
-     */
-    void close() {
-        stop();
-        // TODO: 替换为实际的机器狗SDK关闭代码
-        std::cout << "[机器狗] 已关闭" << std::endl;
-    }
-};
 
 // ============================================================================
 // 跟随控制器类
@@ -166,7 +117,10 @@ public:
         : lost_frame_count_(0)
         , is_following_(false)
         , radial_at_max_speed_(false)
-        , angular_at_max_speed_(false) {
+        , angular_at_max_speed_(false)
+        , prev_radial_speed_(0.0)
+        , prev_angular_speed_(0.0)
+        , first_frame_(true) {
     }
     
     /**
@@ -279,7 +233,6 @@ public:
             
             // 计算二次函数系数
             double radial_coeff = FollowConfig::RADIAL_COEFF_A * distance_diff * distance_diff
-                                + FollowConfig::RADIAL_COEFF_B * distance_diff
                                 + FollowConfig::RADIAL_COEFF_C;
             
             // 机器狗的径向速度 = 人的径向速度 × 系数
@@ -322,7 +275,6 @@ public:
             
             // 计算二次函数系数
             double angular_coeff = FollowConfig::ANGULAR_COEFF_A * angle_diff * angle_diff
-                                 + FollowConfig::ANGULAR_COEFF_B * angle_diff
                                  + FollowConfig::ANGULAR_COEFF_C;
             
             // 机器狗的角速度 = 人的角速度 × 系数
@@ -355,6 +307,26 @@ public:
             angular_at_max_speed_ = false;
         }
         
+        // ============== 速度平滑处理 ==============
+        
+        if (first_frame_) {
+            // 第一帧不平滑，直接使用计算值
+            prev_radial_speed_ = x_speed;
+            prev_angular_speed_ = angular_speed;
+            first_frame_ = false;
+        } else {
+            // 使用指数移动平均进行平滑
+            // smoothed = alpha * current + (1 - alpha) * previous
+            x_speed = FollowConfig::RADIAL_SMOOTH_ALPHA * x_speed 
+                    + (1.0 - FollowConfig::RADIAL_SMOOTH_ALPHA) * prev_radial_speed_;
+            angular_speed = FollowConfig::ANGULAR_SMOOTH_ALPHA * angular_speed 
+                          + (1.0 - FollowConfig::ANGULAR_SMOOTH_ALPHA) * prev_angular_speed_;
+            
+            // 更新上一次速度
+            prev_radial_speed_ = x_speed;
+            prev_angular_speed_ = angular_speed;
+        }
+        
         // ============== 侧向运动（可选） ==============
         
         // 如果人在侧面，可以添加侧移以更快接近
@@ -374,6 +346,9 @@ public:
         is_following_ = false;
         radial_at_max_speed_ = false;
         angular_at_max_speed_ = false;
+        prev_radial_speed_ = 0.0;
+        prev_angular_speed_ = 0.0;
+        first_frame_ = true;
     }
     
     /**
@@ -397,6 +372,11 @@ private:
     bool is_following_;
     bool radial_at_max_speed_;    // 径向是否在最大速度
     bool angular_at_max_speed_;   // 角向是否在最大角速度
+    
+    // 速度平滑变量
+    double prev_radial_speed_;    // 上一次径向速度
+    double prev_angular_speed_;   // 上一次角向速度
+    bool first_frame_;            // 是否是第一帧
 };
 
 // ============================================================================
@@ -409,9 +389,10 @@ int main(int argc, char* argv[]) {
         std::cout << "============================================" << std::endl;
         std::cout << "UWB机器狗跟随程序" << std::endl;
         std::cout << "============================================" << std::endl;
-        std::cout << "\n用法: " << argv[0] << " <串口设备>" << std::endl;
+        std::cout << "\n用法: " << argv[0] << " <串口设备> [--debug]" << std::endl;
         std::cout << "\n示例:" << std::endl;
-        std::cout << "  " << argv[0] << " /dev/ttyUSB0" << std::endl;
+        std::cout << "  " << argv[0] << " /dev/ttyUSB0         # 正常模式" << std::endl;
+        std::cout << "  " << argv[0] << " /dev/ttyUSB0 --debug # 调试模式" << std::endl;
         std::cout << "\n控制逻辑:" << std::endl;
         std::cout << "  - 径向运动: 速度 = 人的径向速度 × f(distance_diff)" << std::endl;
         std::cout << "  - 角向运动: 角速度 = 人的角速度 × f(angle_diff)" << std::endl;
@@ -427,6 +408,12 @@ int main(int argc, char* argv[]) {
     
     std::string port = argv[1];
     
+    // 检查调试模式
+    bool debug_mode = false;
+    if (argc >= 3 && std::string(argv[2]) == "--debug") {
+        debug_mode = true;
+    }
+    
     // 注册信号处理
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
@@ -435,6 +422,7 @@ int main(int argc, char* argv[]) {
     std::cout << "UWB机器狗跟随程序 启动" << std::endl;
     std::cout << "============================================" << std::endl;
     std::cout << "串口设备: " << port << std::endl;
+    std::cout << "调试模式: " << (debug_mode ? "开启" : "关闭") << std::endl;
     std::cout << "最小启动距离: " << FollowConfig::MIN_DISTANCE << " cm" << std::endl;
     std::cout << "控制逻辑: 速度 = 人的速度 × 二次函数系数" << std::endl;
     std::cout << "按 Ctrl+C 退出" << std::endl;
@@ -444,17 +432,13 @@ int main(int argc, char* argv[]) {
     UWBFollower uwb_follower;
     if (!uwb_follower.init(port)) {
         std::cerr << "[错误] 无法打开串口: " << port << std::endl;
+        std::cerr << "[提示] 请检查:" << std::endl;
+        std::cerr << "  1. 串口设备是否存在: ls " << port << std::endl;
+        std::cerr << "  2. 串口权限: sudo chmod 666 " << port << std::endl;
+        std::cerr << "  3. 或者添加用户到dialout组: sudo usermod -aG dialout $USER" << std::endl;
         return 1;
     }
     std::cout << "[信息] UWB串口已连接" << std::endl;
-    
-    // 初始化机器狗
-    RobotDog dog;
-    if (!dog.init()) {
-        std::cerr << "[错误] 机器狗初始化失败" << std::endl;
-        uwb_follower.close();
-        return 1;
-    }
     
     // 创建跟随控制器
     FollowController controller;
@@ -465,24 +449,40 @@ int main(int argc, char* argv[]) {
     double angular_speed = 0.0;
     
     int frame_count = 0;
+    int valid_count = 0;     // 有效数据计数
+    int invalid_count = 0;   // 无效数据计数
     
     // ============== 主控制循环 ==============
     
     std::cout << "[信息] 开始跟随控制循环..." << std::endl;
+    if (debug_mode) {
+        std::cout << "[调试] 等待UWB数据..." << std::endl;
+    }
     
     while (g_running) {
         // 获取UWB数据
         UWB2DData uwb_data = uwb_follower.getData();
         
+        // 调试模式：显示详细信息
+        if (debug_mode) {
+            if (uwb_data.is_valid) {
+                valid_count++;
+                printf("[调试] 有效数据 #%d: 距离=%.0fcm 角度=%.1f° X=%.1f Y=%.1f Vx=%.1f Vy=%.1f\n",
+                       valid_count, uwb_data.distance_cm, uwb_data.azimuth_deg,
+                       uwb_data.x, uwb_data.y, uwb_data.vx, uwb_data.vy);
+            } else {
+                invalid_count++;
+                if (invalid_count % 100 == 0) {  // 每100次无效数据报告一次
+                    printf("[调试] 无效数据累计: %d (有效: %d)\n", invalid_count, valid_count);
+                    // 检查原始统计
+                    printf("[调试] UWB统计: 总帧=%d 滤波后=%d\n",
+                           uwb_follower.getTotalCount(), uwb_follower.getFilteredCount());
+                }
+            }
+        }
+        
         // 计算控制指令
         bool should_move = controller.computeControl(uwb_data, x_speed, y_speed, angular_speed);
-        
-        // 发送控制指令
-        if (should_move) {
-            dog.move(x_speed, y_speed, angular_speed);
-        } else {
-            dog.stop();
-        }
         
         // 定期输出状态信息
         frame_count++;
@@ -493,7 +493,7 @@ int main(int argc, char* argv[]) {
                        x_speed, y_speed, angular_speed,
                        controller.isFollowing() ? "跟随中" : "等待中");
             } else {
-                printf("[状态] 等待UWB数据...\n");
+                printf("[状态] 等待UWB数据... (有效:%d 无效:%d)\n", valid_count, invalid_count);
             }
         }
         
@@ -504,8 +504,7 @@ int main(int argc, char* argv[]) {
     // ============== 清理 ==============
     
     std::cout << "\n[信息] 正在关闭..." << std::endl;
-    dog.stop();
-    dog.close();
+    std::cout << "[统计] 有效数据: " << valid_count << " 无效数据: " << invalid_count << std::endl;
     uwb_follower.close();
     
     std::cout << "[信息] 程序已退出" << std::endl;
