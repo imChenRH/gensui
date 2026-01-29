@@ -41,3 +41,10 @@ Thumbs.db
 *.xlsx
 *.xls
 *.csv
+
+# C++ compiled files
+*.o
+*.exe
+dog_follow_human
+example_test
+example_usage
