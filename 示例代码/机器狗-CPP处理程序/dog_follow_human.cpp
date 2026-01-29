@@ -23,7 +23,8 @@
  *     g++ dog_follow_human.cpp uwb_follower.cpp -o dog_follow_human -std=c++11 -lm
  * 
  * 运行命令：
- *     ./dog_follow_human /dev/ttyUSB0
+ *     ./dog_follow_human /dev/ttyUSB0           # 正常模式
+ *     ./dog_follow_human /dev/ttyUSB0 --debug   # 调试模式（显示详细信息）
  * 
  * 作者：Copilot
  * 日期：2026-01-28
@@ -445,9 +446,10 @@ int main(int argc, char* argv[]) {
         std::cout << "============================================" << std::endl;
         std::cout << "UWB机器狗跟随程序" << std::endl;
         std::cout << "============================================" << std::endl;
-        std::cout << "\n用法: " << argv[0] << " <串口设备>" << std::endl;
+        std::cout << "\n用法: " << argv[0] << " <串口设备> [--debug]" << std::endl;
         std::cout << "\n示例:" << std::endl;
-        std::cout << "  " << argv[0] << " /dev/ttyUSB0" << std::endl;
+        std::cout << "  " << argv[0] << " /dev/ttyUSB0         # 正常模式" << std::endl;
+        std::cout << "  " << argv[0] << " /dev/ttyUSB0 --debug # 调试模式" << std::endl;
         std::cout << "\n控制逻辑:" << std::endl;
         std::cout << "  - 径向运动: 速度 = 人的径向速度 × f(distance_diff)" << std::endl;
         std::cout << "  - 角向运动: 角速度 = 人的角速度 × f(angle_diff)" << std::endl;
@@ -463,6 +465,12 @@ int main(int argc, char* argv[]) {
     
     std::string port = argv[1];
     
+    // 检查调试模式
+    bool debug_mode = false;
+    if (argc >= 3 && std::string(argv[2]) == "--debug") {
+        debug_mode = true;
+    }
+    
     // 注册信号处理
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
@@ -471,6 +479,7 @@ int main(int argc, char* argv[]) {
     std::cout << "UWB机器狗跟随程序 启动" << std::endl;
     std::cout << "============================================" << std::endl;
     std::cout << "串口设备: " << port << std::endl;
+    std::cout << "调试模式: " << (debug_mode ? "开启" : "关闭") << std::endl;
     std::cout << "最小启动距离: " << FollowConfig::MIN_DISTANCE << " cm" << std::endl;
     std::cout << "控制逻辑: 速度 = 人的速度 × 二次函数系数" << std::endl;
     std::cout << "按 Ctrl+C 退出" << std::endl;
@@ -480,6 +489,10 @@ int main(int argc, char* argv[]) {
     UWBFollower uwb_follower;
     if (!uwb_follower.init(port)) {
         std::cerr << "[错误] 无法打开串口: " << port << std::endl;
+        std::cerr << "[提示] 请检查:" << std::endl;
+        std::cerr << "  1. 串口设备是否存在: ls " << port << std::endl;
+        std::cerr << "  2. 串口权限: sudo chmod 666 " << port << std::endl;
+        std::cerr << "  3. 或者添加用户到dialout组: sudo usermod -aG dialout $USER" << std::endl;
         return 1;
     }
     std::cout << "[信息] UWB串口已连接" << std::endl;
@@ -501,14 +514,37 @@ int main(int argc, char* argv[]) {
     double angular_speed = 0.0;
     
     int frame_count = 0;
+    int valid_count = 0;     // 有效数据计数
+    int invalid_count = 0;   // 无效数据计数
     
     // ============== 主控制循环 ==============
     
     std::cout << "[信息] 开始跟随控制循环..." << std::endl;
+    if (debug_mode) {
+        std::cout << "[调试] 等待UWB数据..." << std::endl;
+    }
     
     while (g_running) {
         // 获取UWB数据
         UWB2DData uwb_data = uwb_follower.getData();
+        
+        // 调试模式：显示详细信息
+        if (debug_mode) {
+            if (uwb_data.is_valid) {
+                valid_count++;
+                printf("[调试] 有效数据 #%d: 距离=%.0fcm 角度=%.1f° X=%.1f Y=%.1f Vx=%.1f Vy=%.1f\n",
+                       valid_count, uwb_data.distance_cm, uwb_data.azimuth_deg,
+                       uwb_data.x, uwb_data.y, uwb_data.vx, uwb_data.vy);
+            } else {
+                invalid_count++;
+                if (invalid_count % 100 == 0) {  // 每100次无效数据报告一次
+                    printf("[调试] 无效数据累计: %d (有效: %d)\n", invalid_count, valid_count);
+                    // 检查原始统计
+                    printf("[调试] UWB统计: 总帧=%d 滤波后=%d\n",
+                           uwb_follower.getTotalCount(), uwb_follower.getFilteredCount());
+                }
+            }
+        }
         
         // 计算控制指令
         bool should_move = controller.computeControl(uwb_data, x_speed, y_speed, angular_speed);
@@ -529,7 +565,7 @@ int main(int argc, char* argv[]) {
                        x_speed, y_speed, angular_speed,
                        controller.isFollowing() ? "跟随中" : "等待中");
             } else {
-                printf("[状态] 等待UWB数据...\n");
+                printf("[状态] 等待UWB数据... (有效:%d 无效:%d)\n", valid_count, invalid_count);
             }
         }
         
@@ -540,6 +576,7 @@ int main(int argc, char* argv[]) {
     // ============== 清理 ==============
     
     std::cout << "\n[信息] 正在关闭..." << std::endl;
+    std::cout << "[统计] 有效数据: " << valid_count << " 无效数据: " << invalid_count << std::endl;
     dog.stop();
     dog.close();
     uwb_follower.close();

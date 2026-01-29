@@ -370,26 +370,38 @@ bool UWBFrameParser::feedByte(uint8_t byte, UWBRawData& out_data) {
             }
             
             if (xor_check == buffer_[UWBConfig::FRAME_SIZE - 1]) {
-                uint16_t cmd = (buffer_[8] << 8) | buffer_[9];
+                uint16_t cmd = (static_cast<uint16_t>(buffer_[8]) << 8) | 
+                               static_cast<uint16_t>(buffer_[9]);
                 
                 if (cmd == CMD_LOCATION) {
+                    // 注意：必须先转换为uint32_t再位移，否则uint8_t左移24位会溢出
                     out_data.anchor_id = U32HighLowByteSwap(
-                        (buffer_[12] << 24) | (buffer_[13] << 16) |
-                        (buffer_[14] << 8) | buffer_[15]);
+                        (static_cast<uint32_t>(buffer_[12]) << 24) | 
+                        (static_cast<uint32_t>(buffer_[13]) << 16) |
+                        (static_cast<uint32_t>(buffer_[14]) << 8) | 
+                        static_cast<uint32_t>(buffer_[15]));
                     
                     out_data.tag_id = U32HighLowByteSwap(
-                        (buffer_[16] << 24) | (buffer_[17] << 16) |
-                        (buffer_[18] << 8) | buffer_[19]);
+                        (static_cast<uint32_t>(buffer_[16]) << 24) | 
+                        (static_cast<uint32_t>(buffer_[17]) << 16) |
+                        (static_cast<uint32_t>(buffer_[18]) << 8) | 
+                        static_cast<uint32_t>(buffer_[19]));
                     
                     out_data.distance_cm = U32HighLowByteSwap(
-                        (buffer_[20] << 24) | (buffer_[21] << 16) |
-                        (buffer_[22] << 8) | buffer_[23]);
+                        (static_cast<uint32_t>(buffer_[20]) << 24) | 
+                        (static_cast<uint32_t>(buffer_[21]) << 16) |
+                        (static_cast<uint32_t>(buffer_[22]) << 8) | 
+                        static_cast<uint32_t>(buffer_[23]));
                     
                     out_data.azimuth_deg = static_cast<int16_t>(
-                        U16HighLowByteSwap((buffer_[24] << 8) | buffer_[25]));
+                        U16HighLowByteSwap(
+                            (static_cast<uint16_t>(buffer_[24]) << 8) | 
+                            static_cast<uint16_t>(buffer_[25])));
                     
                     out_data.elevation_deg = static_cast<int16_t>(
-                        U16HighLowByteSwap((buffer_[26] << 8) | buffer_[27]));
+                        U16HighLowByteSwap(
+                            (static_cast<uint16_t>(buffer_[26]) << 8) | 
+                            static_cast<uint16_t>(buffer_[27])));
                     
                     out_data.is_valid = true;
                     
