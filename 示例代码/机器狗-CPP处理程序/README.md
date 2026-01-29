@@ -4,7 +4,9 @@
 
 本程序用于机器狗接收UWB基站数据，进行数据滤波处理，实现跟随人的功能。
 
-**已封装为库**，方便跟随程序调用！
+**提供两种封装方式：**
+1. **DogController（整合版）** - 直接返回机器狗速度指令，一行代码搞定！
+2. **UWBFollower** - 返回位置数据，自己实现跟随逻辑
 
 参考资料：
 - STM32F1-Usart文件夹（数据帧解析）
@@ -14,38 +16,90 @@
 
 | 文件 | 说明 |
 |------|------|
-| `uwb_follower.h` | **库头文件** - 包含此文件即可使用 |
-| `uwb_follower.cpp` | **库实现文件** - 编译时需链接 |
-| `dog_follow_human.cpp` | **跟随控制程序** - 完整的2.5米跟随实现 |
-| `example_usage.cpp` | 使用示例代码 |
-| `uwb_dog_follower.cpp` | 独立版完整程序 |
+| **dog_controller.h** | **整合库头文件** - 直接返回速度指令 |
+| **dog_controller.cpp** | **整合库实现** - 包含UWB+跟随控制 |
+| `uwb_follower.h` | UWB数据库头文件 |
+| `uwb_follower.cpp` | UWB数据库实现 |
+| **simple_example.cpp** | **简单示例** - 展示如何使用 |
+| `dog_follow_human.cpp` | 完整跟随程序 |
+| `example_usage.cpp` | 旧版示例代码 |
 
-## 🚀 快速使用（推荐）
+## 🚀 快速使用（整合版 - 推荐！）
+
+**一行代码获取机器狗速度指令！**
+
+```cpp
+#include "dog_controller.h"
+
+int main() {
+    DogController dog;
+    
+    // 初始化
+    if (!dog.init("/dev/ttyUSB0")) {
+        return -1;
+    }
+    
+    // 可选配置
+    // dog.setFollowDistance(200.0);  // 设置跟随距离2米
+    // dog.setMaxSpeed(1.0, 0.5);     // 设置最大速度
+    // dog.setDebugMode(true);        // 开启调试输出
+    
+    while (true) {
+        // ========== 核心代码就这一行！ ==========
+        DogVelocity vel = dog.getVelocity();
+        
+        if (vel.is_valid) {
+            // 调用您的机器狗SDK
+            your_robot.move(vel.vx, vel.vy, vel.omega);
+            
+            // vx    : 前进速度 (m/s)
+            // vy    : 侧向速度 (m/s)，通常为0
+            // omega : 角速度 (rad/s)
+        }
+        
+        usleep(50000);  // 50ms控制周期
+    }
+    
+    return 0;
+}
+```
+
+### DogVelocity 结构体
+
+```cpp
+struct DogVelocity {
+    double vx;          // 前进速度 (m/s)
+    double vy;          // 侧向速度 (m/s)
+    double omega;       // 角速度 (rad/s)
+    bool is_valid;      // 数据有效
+    bool is_following;  // 正在跟随
+    
+    // 调试信息
+    double distance_cm;  // 当前距离
+    double azimuth_deg;  // 当前角度
+};
+```
+
+## 方式二：使用UWBFollower（仅获取位置）
 
 ```cpp
 #include "uwb_follower.h"
 
 int main() {
-    // 1. 创建实例
     UWBFollower follower;
+    follower.init("/dev/ttyUSB0");
     
-    // 2. 初始化串口
-    if (!follower.init("/dev/ttyUSB0")) {
-        return -1;
-    }
-    
-    // 3. 循环获取数据
     while (true) {
         UWB2DData data = follower.getData();
         
         if (data.is_valid) {
-            // 使用坐标控制机器狗
+            // 自己实现跟随控制逻辑
             double x = data.x;      // X坐标 (cm)
             double y = data.y;      // Y坐标 (cm)
             double vx = data.vx;    // X速度 (cm/s)
             double vy = data.vy;    // Y速度 (cm/s)
             
-            // robot_control(x, y, vx, vy);
+            // your_control_logic(x, y, vx, vy);
         }
     }
     
@@ -81,29 +135,25 @@ Y = Distance × cos(Azimuth)
 
 ## 编译方法
 
-### 方式一：编译为库（推荐）
+### 方式一：使用整合库（推荐）
 ```bash
-# 编译库
-g++ -c uwb_follower.cpp -o uwb_follower.o -std=c++11
+g++ simple_example.cpp dog_controller.cpp uwb_follower.cpp -o simple_example -std=c++11 -lm
+```
 
-# 编译主程序并链接库
+### 方式二：使用UWB库
+```bash
+g++ -c uwb_follower.cpp -o uwb_follower.o -std=c++11
 g++ your_main.cpp uwb_follower.o -o your_program -std=c++11 -lm
 ```
 
-### 方式二：编译示例程序
+### 方式三：编译完整跟随程序
 ```bash
-g++ example_usage.cpp uwb_follower.cpp -o dog_follow -std=c++11 -lm
-```
-
-### 方式三：编译独立版
-```bash
-g++ -o uwb_dog_follower uwb_dog_follower.cpp -std=c++11 -lm
+g++ dog_follow_human.cpp uwb_follower.cpp -o dog_follow_human -std=c++11 -lm
 ```
 
 ### 交叉编译（ARM平台）
 ```bash
-arm-linux-gnueabihf-g++ -c uwb_follower.cpp -o uwb_follower.o -std=c++11
-arm-linux-gnueabihf-g++ your_main.cpp uwb_follower.o -o your_program -std=c++11 -lm
+arm-linux-gnueabihf-g++ simple_example.cpp dog_controller.cpp uwb_follower.cpp -o simple_example -std=c++11 -lm
 ```
 
 ## 使用方法
